@@ -8,8 +8,8 @@ non-root Android application.
 
 Remote desktop is **screen sharing only** through the MediaProjection path: a
 MeshCentral operator sees the device display but cannot control it. Enabling the
-bundled accessibility service adds tap, swipe, scroll, and key input for
-unattended control, within the limits described under Non-Root Limitations.
+bundled accessibility service adds tap, long press, drag, scroll, and key input
+for unattended control, within the limits described under Non-Root Limitations.
 
 The agent uses Android's public
 [MediaProjection API](https://developer.android.com/media/grow/media-projection)
@@ -97,6 +97,11 @@ last viewer disconnects, allowing later viewers to reuse the active capture
 session without another prompt. With the setting disabled, projection stops
 when the final remote desktop tunnel closes.
 
+Prompts also follow the server's consent flags: with automatic consent on, a
+session whose policy sets the desktop or files prompt bit still asks the device
+user, and a prompt expires after the server's consent timeout (30 seconds by
+default) as a denial unless the server allows auto-accept on timeout.
+
 Projection also stops when the user stops sharing through Android, the app asks
 the service to stop, the agent is disconnected, the process is terminated, or
 Android revokes the projection. A stopped or lost projection cannot be silently
@@ -115,13 +120,32 @@ mouse, touch, and key messages are recognized by `MeshTunnel` but do nothing, so
 that path is view-only.
 
 When the device user explicitly enables the bundled `MeshAccessibilityService`
-in Android settings, those messages are injected as tap, long-press, swipe, and
-scroll gestures and key events, giving unattended control. This is not equivalent
-to root-level input: support varies by Android version and device vendor, some
-screens reject accessibility gestures, text and key handling are incomplete,
-`FLAG_SECURE` windows still capture blank, and Android shows persistent privacy
-indicators. The service is opt-in and must not be treated as a way to bypass user
-consent.
+in Android settings, pointer input is streamed to the screen as accessibility
+gestures. A button press puts a finger on the screen, mouse moves drag it, and
+the release lifts it, so the device reacts as it would to a real touch:
+
+| Viewer action | Device |
+| --- | --- |
+| Click | Tap |
+| Press and hold | Long press (context menus, text selection) |
+| Drag | Live drag: scrolling, selection handles, moving icons after a long press |
+| Double-click | Double tap |
+| Mouse wheel | Swipe up or down under the cursor |
+| Right-click | Back |
+| Middle-click | Home |
+
+Keyboard input is limited to the focused editable field plus Backspace, Enter,
+and arrow navigation. The on-screen panel buttons map to Android global actions
+(Back, Home, Recents, notifications, quick settings, lock, power). The Apps
+button uses the Android 14+ accessibility all-apps action when the launcher
+honours it and otherwise goes Home and swipes up, which opens the app drawer on
+stock and most vendor launchers.
+
+This is not equivalent to root-level input: support varies by Android version
+and device vendor, some screens reject accessibility gestures, multi-touch
+gestures such as pinch are not available, `FLAG_SECURE` windows still capture
+blank, and Android shows persistent privacy indicators. The service is opt-in
+and must not be treated as a way to bypass user consent.
 
 ### Protected content may be blank
 
@@ -131,12 +155,16 @@ and some system screens commonly use this protection. MediaProjection returns
 blank or obscured content for protected surfaces. A non-root agent cannot
 override this policy.
 
-### The lock screen cannot be managed
+### The lock screen is only partly usable
 
-The agent cannot silently unlock the device, enter a PIN, dismiss a secure key
-guard, change lock-screen security, or keep the device unlocked against system
-policy. What MediaProjection exposes while the device is locked depends on the
-Android version, device vendor, and lock-screen security configuration.
+The agent wakes the display when a session starts and for a minute after each
+operator action, so a sleeping device shows its lock screen instead of a black
+frame. The lock screen itself captures normally, but Android blanks the PIN and
+password entry from screen capture, so the viewer goes black once it is opened.
+Digits, Backspace and Enter typed on the operator's keyboard are pressed on the
+keyguard's own buttons, which allows a blind unlock with a PIN or password;
+pattern locks cannot be entered remotely. The agent cannot change lock-screen
+security or keep the device unlocked against system policy.
 
 ### No silent background start
 
@@ -175,11 +203,11 @@ inspection and support rather than smooth video playback.
 | Multiple viewers | Supported; frames are broadcast to active desktop tunnels | Device and network load |
 | Rotation | Supported by recreating the virtual display | Brief update interruption |
 | Quality and scaling | Supported | Server settings and device cost |
-| Remote tap, swipe, or typing | Supported with the accessibility service enabled; otherwise a no-op | Requires user-enabled `MeshAccessibilityService` |
+| Remote tap, long press, drag, or typing | Supported with the accessibility service enabled; otherwise a no-op | Requires user-enabled `MeshAccessibilityService` |
 | Secure or DRM content | Not capturable | Android secure-surface policy |
 | Silent capture after restart | Not supported | MediaProjection authorization and lifecycle rules |
 | Hide sharing notification | Not supported | Foreground-service requirement |
-| Unlock or control the lock screen | Not supported | Android keyguard security |
+| Unlock the lock screen | PIN or password typed blind; the entry screen captures black and pattern locks are not supported | Android keyguard security |
 | Remote desktop audio | Not supported | Not implemented |
 
 ## Security Model

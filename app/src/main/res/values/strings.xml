@@ -45,6 +45,8 @@
     <string name="battery_optimization_summary">Allow background operation for reliable startup and reconnect</string>
     <string name="notification_permission">Notifications</string>
     <string name="notification_permission_summary">Allow the foreground service status notification</string>
+    <string name="all_files_access">All files access</string>
+    <string name="all_files_access_summary">Allow browsing and transferring any file on shared storage</string>
     <string name="boot_start">Startup</string>
     <string name="boot_start_summary">Starts automatically after reboot when paired</string>
     <string name="ready">Ready</string>
@@ -72,9 +74,13 @@
     <string name="session_active_title">Remote session active</string>
     <string name="session_connected_one">Connected %1$s</string>
     <string name="session_connected_many">%1$d users connected</string>
-    <string name="unattended_consent_message">A remote user wants to view and control this screen for this session. Allow screen sharing?</string>
+    <string name="remote_user">A remote user</string>
+    <string name="unattended_consent_message">%1$s wants to view and control this screen for this session. Allow screen sharing?</string>
     <string name="approve_screen_sharing_title">Approve screen sharing</string>
-    <string name="approve_screen_sharing_body">A remote user is requesting to view and control this screen.</string>
+    <string name="approve_files_title">Approve file access</string>
+    <string name="files_consent_message">%1$s wants to browse and transfer files on this device for this session. Allow file access?</string>
+    <string name="desktop_session_started">%1$s started a remote desktop session.</string>
+    <string name="files_session_started">%1$s started a remote files session.</string>
     <string name="approve">Approve</string>
     <string name="deny">Deny</string>
     <string name="setup_message">Setup to: %1$s?</string>

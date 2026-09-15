@@ -86,6 +86,12 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
 
         var bitmap = Bitmap.createBitmap(mWidth + rowPadding / pixelStride, mHeight, Bitmap.Config.ARGB_8888)
         bitmap.copyPixelsFromBuffer(buffer)
+        if (rowPadding > 0) {
+            // The stride padding would otherwise be streamed as garbage columns past the screen edge.
+            val cropped = Bitmap.createBitmap(bitmap, 0, 0, mWidth, mHeight)
+            bitmap.recycle()
+            bitmap = cropped
+        }
 
         if (g_desktop_scalingLevel != 1024 && g_desktop_scalingLevel > 0) {
             val newWidth = max(1, (mWidth * g_desktop_scalingLevel) / 1024)
@@ -251,6 +257,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
                 g_ScreenCaptureService = this
                 g_remoteDesktopProvider = this
                 updateTunnelDisplaySize()
+                AgentController.desktopProviderStarted()
                 sendAgentConsole("Started display sharing")
             }
         }

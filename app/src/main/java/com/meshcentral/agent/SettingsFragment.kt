@@ -37,6 +37,21 @@ class SettingsFragment : PreferenceFragmentCompat() {
             }
             true
         }
+        findPreference<Preference>("pref_all_files_access")?.apply {
+            isVisible = AgentController.allFilesAccessAvailable
+            setOnPreferenceClickListener {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                        intent.data = Uri.parse("package:${requireContext().packageName}")
+                        startActivity(intent)
+                    } catch (ex: Exception) {
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    }
+                }
+                true
+            }
+        }
         findPreference<Preference>("pref_notification_permission")?.setOnPreferenceClickListener {
             val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
@@ -54,6 +69,12 @@ class SettingsFragment : PreferenceFragmentCompat() {
         super.onViewCreated(view, savedInstanceState)
         settingsFragment = this;
         visibleScreen = 5;
+        refreshStatus()
+    }
+
+    // Summaries reflect system settings the user may just have changed on another screen.
+    override fun onResume() {
+        super.onResume()
         refreshStatus()
     }
 
@@ -80,6 +101,12 @@ class SettingsFragment : PreferenceFragmentCompat() {
                 getString(R.string.ready)
             } else {
                 getString(R.string.battery_optimization_summary)
+            }
+        findPreference<Preference>("pref_all_files_access")?.summary =
+            if (AgentController.hasAllFilesAccess()) {
+                getString(R.string.ready)
+            } else {
+                getString(R.string.all_files_access_summary)
             }
         findPreference<Preference>("pref_notification_permission")?.summary =
             if (AgentController.areNotificationsEnabled()) {

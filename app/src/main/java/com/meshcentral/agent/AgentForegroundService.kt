@@ -39,6 +39,14 @@ class AgentForegroundService : Service() {
                 cancelConsentNotification(this)
                 AgentController.denyUnattendedConsent()
             }
+            ACTION_APPROVE_FILES -> {
+                cancelFilesConsentNotification(this)
+                AgentController.confirmFilesConsent()
+            }
+            ACTION_DENY_FILES -> {
+                cancelFilesConsentNotification(this)
+                AgentController.denyFilesConsent()
+            }
             ACTION_STOP -> {
                 if (!AgentController.enterpriseEnforced) {
                     if (meshAgent != null) AgentController.toggleAgentConnection(true)
@@ -140,11 +148,14 @@ class AgentForegroundService : Service() {
         private const val RUNTIME_NOTIFICATION_ID = 2402
         private const val SESSION_NOTIFICATION_ID = 2403
         private const val CONSENT_NOTIFICATION_ID = 2404
+        private const val FILES_CONSENT_NOTIFICATION_ID = 2405
         private const val ACTION_CONNECT = "com.meshcentral.agent.action.CONNECT"
         private const val ACTION_DISCONNECT = "com.meshcentral.agent.action.DISCONNECT"
         private const val ACTION_STOP_SCREEN_SHARING = "com.meshcentral.agent.action.STOP_SCREEN_SHARING"
         private const val ACTION_APPROVE_SCREEN_SHARING = "com.meshcentral.agent.action.APPROVE_SCREEN_SHARING"
         private const val ACTION_DENY_SCREEN_SHARING = "com.meshcentral.agent.action.DENY_SCREEN_SHARING"
+        private const val ACTION_APPROVE_FILES = "com.meshcentral.agent.action.APPROVE_FILES"
+        private const val ACTION_DENY_FILES = "com.meshcentral.agent.action.DENY_FILES"
         private const val ACTION_STOP = "com.meshcentral.agent.action.STOP"
 
         fun start(context: Context) {
@@ -182,24 +193,33 @@ class AgentForegroundService : Service() {
         }
 
         // Consent request with Approve/Deny actions, for when the app isn't foregrounded.
-        fun showConsentNotification(context: Context) {
+        fun showConsentNotification(context: Context, message: String) {
+            showConsentNotification(context, CONSENT_NOTIFICATION_ID, context.getString(R.string.approve_screen_sharing_title), message,
+                servicePendingIntent(context, ACTION_APPROVE_SCREEN_SHARING, 4), servicePendingIntent(context, ACTION_DENY_SCREEN_SHARING, 5))
+        }
+
+        fun showFilesConsentNotification(context: Context, message: String) {
+            showConsentNotification(context, FILES_CONSENT_NOTIFICATION_ID, context.getString(R.string.approve_files_title), message,
+                servicePendingIntent(context, ACTION_APPROVE_FILES, 6), servicePendingIntent(context, ACTION_DENY_FILES, 7))
+        }
+
+        private fun showConsentNotification(context: Context, id: Int, title: String, message: String, approve: PendingIntent, deny: PendingIntent) {
             createConsentNotificationChannel(context)
-            val body = context.getString(R.string.approve_screen_sharing_body)
             val notification = NotificationCompat.Builder(context, CONSENT_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_cloud)
-                .setContentTitle(context.getString(R.string.approve_screen_sharing_title))
-                .setContentText(body)
-                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setContentTitle(title)
+                .setContentText(message)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(message))
                 .setContentIntent(openAppPendingIntent(context, null))
                 .setCategory(Notification.CATEGORY_CALL)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setOngoing(true)
                 .setAutoCancel(false)
-                .addAction(R.drawable.ic_cloud, context.getString(R.string.approve), servicePendingIntent(context, ACTION_APPROVE_SCREEN_SHARING, 4))
-                .addAction(R.drawable.ic_cloud, context.getString(R.string.deny), servicePendingIntent(context, ACTION_DENY_SCREEN_SHARING, 5))
+                .addAction(R.drawable.ic_cloud, context.getString(R.string.approve), approve)
+                .addAction(R.drawable.ic_cloud, context.getString(R.string.deny), deny)
                 .build()
             try {
-                NotificationManagerCompat.from(context).notify(CONSENT_NOTIFICATION_ID, notification)
+                NotificationManagerCompat.from(context).notify(id, notification)
             } catch (_: SecurityException) {
             }
         }
@@ -207,6 +227,13 @@ class AgentForegroundService : Service() {
         fun cancelConsentNotification(context: Context) {
             try {
                 NotificationManagerCompat.from(context).cancel(CONSENT_NOTIFICATION_ID)
+            } catch (_: SecurityException) {
+            }
+        }
+
+        fun cancelFilesConsentNotification(context: Context) {
+            try {
+                NotificationManagerCompat.from(context).cancel(FILES_CONSENT_NOTIFICATION_ID)
             } catch (_: SecurityException) {
             }
         }

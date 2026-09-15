@@ -13,9 +13,11 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
@@ -30,8 +32,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.preference.PreferenceManager
 import com.google.firebase.messaging.FirebaseMessaging
 import okio.ByteString
-import okio.ByteString.Companion.toByteString
-import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.math.BigInteger
 import java.security.KeyFactory
@@ -83,6 +83,9 @@ object AgentController : AgentHost {
     private const val TAG = "AgentController"
     private const val INITIAL_RETRY_DELAY_MS = 10_000L
     private const val MAX_RETRY_DELAY_MS = 300_000L
+    private const val DESKTOP_NOTICE_TIMEOUT_SECONDS = 8
+    private const val SCREEN_AWAKE_MS = 60_000L
+    private const val SCREEN_AWAKE_REFRESH_MS = 15_000L
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val AGENT_KEY_ALIAS = "meshcentral-agent-identity"
     private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
@@ -100,10 +103,29 @@ object AgentController : AgentHost {
     private var handlingSettingsChange = false
     private var projectionRetryRunnable: Runnable? = null
     private var projectionRetryCount = 0
+    // Consent prompts expire like the other agents' do: the server's timeout, 30 s by default.
+    private var desktopConsentTimeout: Runnable? = null
+    private var filesConsentTimeout: Runnable? = null
+    private var screenWakeLock: PowerManager.WakeLock? = null
+    @Volatile private var screenAwakeUntilUptimeMs = 0L
     private val MAX_PROJECTION_RETRIES = 12
 
     val enterpriseEnforced: Boolean
         get() = BuildConfig.ENTERPRISE_ENFORCED
+
+    // Only builds made with -PmeshAllFilesAccess=true declare the permission; the user still has
+    // to grant it in system settings.
+    val allFilesAccessAvailable: Boolean
+        get() = BuildConfig.ALL_FILES_ACCESS && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+
+    fun hasAllFilesAccess(): Boolean {
+        if (!allFilesAccessAvailable || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        return try {
+            Environment.isExternalStorageManager()
+        } catch (ex: Exception) {
+            false
+        }
+    }
 
     override val contentResolver: ContentResolver
         get() = appContext.contentResolver
@@ -303,23 +325,27 @@ object AgentController : AgentHost {
     private fun startProjectionOnHostThread() {
         if (meshAgent == null || meshAgent?.state != 3) return
         if (!hasActiveDesktopTunnel()) return
+        keepScreenAwake()
         if (isRemoteDesktopRunning()) return
         val accessibility = MeshAccessibilityService.instance
         if (accessibility != null) {
             cancelProjectionRetry()
-            if (g_autoConsent) {
+            val tunnel = activeDesktopTunnel()
+            if (tunnel == null || !tunnel.consentPromptRequired()) {
                 if (accessibility.startDesktop()) return
             } else {
-                // Automatic Consent off: require explicit approval before capturing.
+                // Explicit approval before capturing: the app setting or the server's policy asks for it.
+                val message = tunnel.consentMessage(appContext)
                 val mainActivity = activity
                 val resumed = mainActivity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
                 if (mainActivity != null && resumed) {
-                    mainActivity.promptUnattendedConsent()
+                    mainActivity.promptUnattendedConsent(message)
                 } else {
                     // No foreground activity to host a dialog, so ask via the notification.
-                    sendDesktopMessage("Waiting for the device user to approve screen sharing.")
-                    AgentForegroundService.showConsentNotification(appContext)
+                    sendDesktopConsentPending()
+                    AgentForegroundService.showConsentNotification(appContext, message)
                 }
+                armDesktopConsentTimeout(tunnel)
                 return
             }
         } else if (isAccessibilityServiceEnabled() && waitForAccessibilityProjection()) {
@@ -343,7 +369,7 @@ object AgentController : AgentHost {
             return
         }
 
-        sendDesktopMessage("Remote desktop requires Accessibility unattended access or an open app screen for Android capture consent.")
+        sendDesktopMessage("Remote desktop requires Accessibility unattended access or an open app screen for Android capture consent.", timeoutSeconds = null)
         showToastMessage("Enable unattended access in settings to share the screen in the background.")
         showRuntimeNotification(
             appContext.getString(R.string.unattended_access_required),
@@ -354,22 +380,166 @@ object AgentController : AgentHost {
 
     fun confirmUnattendedConsent() {
         if (::appContext.isInitialized) AgentForegroundService.cancelConsentNotification(appContext)
+        cancelDesktopConsentTimeout()
         if (meshAgent?.state != 3 || !hasActiveDesktopTunnel() || isRemoteDesktopRunning()) return
+        activeDesktopTunnel()?.let {
+            it.logSessionEvent(30, "Starting remote desktop after local user accepted")
+            it.notifySessionStart()
+        }
         runOnHostThread { MeshAccessibilityService.instance?.startDesktop() }
     }
 
     fun denyUnattendedConsent() {
+        if (::appContext.isInitialized) AgentForegroundService.cancelConsentNotification(appContext)
+        cancelDesktopConsentTimeout()
+        activity?.dismissConsentPrompt(MainActivity.CONSENT_DESKTOP)
         val tunnel = activeDesktopTunnel() ?: return
-        val json = JSONObject()
-        json.put("type", "console")
-        json.put("msg", "denied")
-        json.put("msgid", 2)
-        tunnel.sendCtrlResponse(json)
+        tunnel.logSessionEvent(34, "Failed to start remote desktop after local user rejected")
+        tunnel.sendConsoleMessage("denied", MeshTunnel.MSGID_CONSENT_DENIED)
         tunnel.Stop()
+    }
+
+    private fun armDesktopConsentTimeout(tunnel: MeshTunnel) {
+        if (desktopConsentTimeout != null) return
+        val runnable = Runnable {
+            desktopConsentTimeout = null
+            if (tunnel.consentAutoAcceptOnTimeout()) confirmUnattendedConsent() else denyUnattendedConsent()
+        }
+        desktopConsentTimeout = runnable
+        mainHandler.postDelayed(runnable, tunnel.consentTimeoutMs())
+    }
+
+    private fun cancelDesktopConsentTimeout() {
+        desktopConsentTimeout?.let { mainHandler.removeCallbacks(it) }
+        desktopConsentTimeout = null
+    }
+
+    // Files sessions: same approval flow as screen sharing, but nothing to capture, so the tunnel
+    // just holds the viewer's requests until the user answers.
+    fun requestFilesConsent(tunnel: MeshTunnel) {
+        runOnHostThread {
+            val message = tunnel.consentMessage(appContext)
+            val mainActivity = activity
+            val resumed = mainActivity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
+            if (mainActivity != null && resumed) {
+                mainActivity.promptFilesConsent(message)
+            } else {
+                AgentForegroundService.showFilesConsentNotification(appContext, message)
+            }
+            if (filesConsentTimeout == null) {
+                val runnable = Runnable {
+                    filesConsentTimeout = null
+                    if (tunnel.consentAutoAcceptOnTimeout()) confirmFilesConsent() else denyFilesConsent()
+                }
+                filesConsentTimeout = runnable
+                mainHandler.postDelayed(runnable, tunnel.consentTimeoutMs())
+            }
+        }
+    }
+
+    // Re-shows the dialog after the activity comes back, e.g. the prompt was answered on the
+    // notification's screen or lost to a rotation.
+    fun showPendingFilesConsent() {
+        val tunnel = pendingFilesConsentTunnels().firstOrNull() ?: return
+        activity?.promptFilesConsent(tunnel.consentMessage(appContext))
+    }
+
+    fun confirmFilesConsent() {
+        runOnHostThread {
+            clearFilesConsentPrompt()
+            for (t in pendingFilesConsentTunnels()) t.approveFilesConsent()
+            refreshInfo()
+        }
+    }
+
+    fun denyFilesConsent() {
+        runOnHostThread {
+            clearFilesConsentPrompt()
+            for (t in pendingFilesConsentTunnels()) t.denyFilesConsent()
+        }
+    }
+
+    // The waiting tunnel went away on its own (viewer closed it), so drop the prompt.
+    fun filesConsentResolved() {
+        runOnHostThread {
+            if (pendingFilesConsentTunnels().isEmpty()) clearFilesConsentPrompt()
+        }
+    }
+
+    private fun pendingFilesConsentTunnels(): List<MeshTunnel> {
+        val agent = meshAgent ?: return emptyList()
+        return agent.tunnels.filter { (it.state == 2) && (it.usage == 5) && it.filesConsentPending }
+    }
+
+    private fun clearFilesConsentPrompt() {
+        if (::appContext.isInitialized) AgentForegroundService.cancelFilesConsentNotification(appContext)
+        filesConsentTimeout?.let { mainHandler.removeCallbacks(it) }
+        filesConsentTimeout = null
+        activity?.dismissConsentPrompt(MainActivity.CONSENT_FILES)
+    }
+
+    // A remote session needs the display on: wake it when a session starts and keep it on for a
+    // minute after each operator action, then let the device sleep as it normally would. A sleeping
+    // or dozing screen captures black and ignores injected touches.
+    @Suppress("DEPRECATION")
+    fun keepScreenAwake() {
+        if (!::appContext.isInitialized) return
+        val now = SystemClock.uptimeMillis()
+        if (now < screenAwakeUntilUptimeMs - SCREEN_AWAKE_MS + SCREEN_AWAKE_REFRESH_MS) return
+        screenAwakeUntilUptimeMs = now + SCREEN_AWAKE_MS
+        runOnHostThread {
+            try {
+                val lock = screenWakeLock ?: run {
+                    val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+                    powerManager.newWakeLock(
+                        PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+                        "MeshCentral:remoteSession"
+                    ).also {
+                        it.setReferenceCounted(false)
+                        screenWakeLock = it
+                    }
+                }
+                lock.acquire(SCREEN_AWAKE_MS)
+            } catch (ex: Exception) {
+                Log.w(TAG, "Unable to wake the screen", ex)
+            }
+        }
+    }
+
+    private fun releaseScreenAwake() {
+        screenAwakeUntilUptimeMs = 0L
+        runOnHostThread {
+            try {
+                val lock = screenWakeLock
+                if (lock != null && lock.isHeld) lock.release()
+            } catch (ex: Exception) {
+            }
+        }
+    }
+
+    // A capture provider just started: take the consent banner off every viewer of this device.
+    fun desktopProviderStarted() {
+        keepScreenAwake()
+        val agent = meshAgent ?: return
+        for (t in agent.tunnels.toList()) {
+            if ((t.state == 2) && (t.usage == 2)) t.sendConsoleMessage(null)
+        }
+        refreshInfo()
+    }
+
+    private fun sendDesktopConsentPending() {
+        val agent = meshAgent ?: return
+        for (t in agent.tunnels.toList()) {
+            if ((t.state == 2) && (t.usage == 2)) {
+                t.sendConsoleMessage(MeshTunnel.CONSENT_PENDING_MESSAGE, MeshTunnel.MSGID_CONSENT_PENDING)
+            }
+        }
     }
 
     override fun stopProjection() {
         if (::appContext.isInitialized) AgentForegroundService.cancelConsentNotification(appContext)
+        cancelDesktopConsentTimeout()
+        releaseScreenAwake()
         val provider = g_remoteDesktopProvider
         if (provider is MeshAccessibilityService) {
             provider.stopDesktop()
@@ -501,17 +671,18 @@ object AgentController : AgentHost {
         }
     }
 
-    fun sendDesktopMessage(message: String) {
-        val bytes = message.toByteArray(Charsets.UTF_8)
-        val data = ByteArray(4 + bytes.size)
-        data[1] = 17
-        data[2] = ((data.size shr 8) and 0xFF).toByte()
-        data[3] = (data.size and 0xFF).toByte()
-        bytes.copyInto(data, 4)
-        sendDesktopTunnelData(data.toByteString())
+    // Notice on every viewer's desktop overlay. The web UI never displays the binary KVM message
+    // command, so this goes over the control channel. A null timeout keeps it up until capture
+    // starts and clears it.
+    fun sendDesktopMessage(message: String, timeoutSeconds: Int? = DESKTOP_NOTICE_TIMEOUT_SECONDS) {
+        val agent = meshAgent ?: return
+        for (t in agent.tunnels.toList()) {
+            if ((t.state == 2) && (t.usage == 2)) t.sendConsoleMessage(message, timeoutSeconds = timeoutSeconds)
+        }
     }
 
     fun handleDesktopMouseCommand(msg: ByteString): Boolean {
+        keepScreenAwake()
         val provider = activeInputProvider()
         if (provider != null && provider.handleMouseCommand(msg)) return true
         sendDesktopMessage("Remote input requires Accessibility unattended access.")
@@ -519,6 +690,7 @@ object AgentController : AgentHost {
     }
 
     fun handleDesktopTouchCommand(msg: ByteString): Boolean {
+        keepScreenAwake()
         val provider = activeInputProvider()
         if (provider != null && provider.handleTouchCommand(msg)) return true
         sendDesktopMessage("Remote touch input requires Accessibility unattended access.")
@@ -526,6 +698,7 @@ object AgentController : AgentHost {
     }
 
     fun handleDesktopKeyCommand(cmd: Int, msg: ByteString): Boolean {
+        keepScreenAwake()
         val provider = activeInputProvider()
         if (provider != null && provider.handleKeyCommand(cmd, msg)) return true
         sendDesktopMessage("Remote keyboard input is limited on Android and requires Accessibility unattended access.")

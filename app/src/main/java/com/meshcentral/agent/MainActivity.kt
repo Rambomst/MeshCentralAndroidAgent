@@ -29,7 +29,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.firebase.messaging.FirebaseMessaging
-import org.json.JSONObject
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
 
@@ -77,6 +76,9 @@ var g_auth_url : Uri? = null
 
 class MainActivity : AppCompatActivity() {
     var alert : AlertDialog? = null
+    // The consent dialog on screen, if any, and which session kind it belongs to.
+    private var consentAlert: AlertDialog? = null
+    private var consentAlertKind = 0
     // Set when the user taps "Later" on the unattended setup prompt; suppresses it for this session
     // only, so it returns on the next launch/resume while items are still missing.
     private var unattendedPromptDismissed = false
@@ -90,21 +92,10 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
+            // The capture service clears the viewer's consent banner once projection is running.
             ContextCompat.startForegroundService(this, ScreenCaptureService.getStartIntent(this, result.resultCode, result.data))
-            AgentController.activeDesktopTunnel()?.sendCtrlResponse(JSONObject().apply {
-                put("type", "console")
-                put("msg", null)
-                put("msgid", 0)
-            })
         } else {
-            AgentController.activeDesktopTunnel()?.let { tunnel ->
-                tunnel.sendCtrlResponse(JSONObject().apply {
-                    put("type", "console")
-                    put("msg", "denied")
-                    put("msgid", 2)
-                })
-                tunnel.Stop()
-            }
+            AgentController.denyUnattendedConsent()
         }
     }
 
@@ -153,6 +144,7 @@ class MainActivity : AppCompatActivity() {
             if (AgentController.hasActiveDesktopTunnel() && !AgentController.isRemoteDesktopRunning()) {
                 AgentController.startProjection()
             }
+            AgentController.showPendingFilesConsent()
         }
         invalidateOptionsMenu()
     }
@@ -291,6 +283,8 @@ class MainActivity : AppCompatActivity() {
             alert?.dismiss()
             alert = null
         }
+        consentAlert?.dismiss()
+        consentAlert = null
         super.onDestroy()
     }
 
@@ -627,25 +621,55 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // Per-connection consent prompt shown when Automatic Consent is off.
-    fun promptUnattendedConsent() {
+    // Per-connection consent prompt for screen sharing.
+    fun promptUnattendedConsent(message: String) {
         if (AgentController.isRemoteDesktopRunning() || (meshAgent == null) || (meshAgent!!.state != 3)) return
+        showConsentPrompt(CONSENT_DESKTOP, R.string.share_screen_choice_title, message, R.string.share_screen_once,
+            onApprove = { AgentController.confirmUnattendedConsent() },
+            onDeny = { AgentController.denyUnattendedConsent() })
+    }
+
+    fun promptFilesConsent(message: String) {
+        if ((meshAgent == null) || (meshAgent!!.state != 3)) return
+        showConsentPrompt(CONSENT_FILES, R.string.approve_files_title, message, R.string.approve,
+            onApprove = { AgentController.confirmFilesConsent() },
+            onDeny = { AgentController.denyFilesConsent() })
+    }
+
+    private fun showConsentPrompt(kind: Int, titleRes: Int, message: String, approveRes: Int, onApprove: () -> Unit, onDeny: () -> Unit) {
         if (isFinishing || isDestroyed) return
+        consentAlert?.dismiss()
+        consentAlert = null
         if (alert != null) {
             alert?.dismiss()
             alert = null
         }
-        alert = AlertDialog.Builder(this)
-            .setTitle(R.string.share_screen_choice_title)
-            .setMessage(R.string.unattended_consent_message)
-            .setPositiveButton(R.string.share_screen_once) { _, _ ->
-                AgentController.confirmUnattendedConsent()
+        consentAlertKind = kind
+        consentAlert = AlertDialog.Builder(this)
+            .setTitle(titleRes)
+            .setMessage(message)
+            .setPositiveButton(approveRes) { _, _ ->
+                consentAlert = null
+                onApprove()
             }
-            .setNegativeButton(android.R.string.cancel) { dialog, _ ->
-                sendDesktopConsentDenied()
+            .setNegativeButton(R.string.deny) { dialog, _ ->
+                consentAlert = null
+                onDeny()
                 dialog.dismiss()
             }
+            // Backing out of the prompt is a refusal, not a silent wait for the timeout.
+            .setOnCancelListener {
+                consentAlert = null
+                onDeny()
+            }
             .show()
+    }
+
+    fun dismissConsentPrompt(kind: Int) {
+        if (consentAlertKind != kind) return
+        val dialog = consentAlert ?: return
+        consentAlert = null
+        dialog.dismiss()
     }
 
     private fun sendDesktopConsentDenied() {
@@ -663,5 +687,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val REQUEST_ALL_PERMISSIONS = 1
         const val REQUEST_LOCAL_NETWORK_PERMISSION = 2
+        const val CONSENT_DESKTOP = 1
+        const val CONSENT_FILES = 2
     }
 }

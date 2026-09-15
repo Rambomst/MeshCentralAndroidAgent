@@ -38,6 +38,10 @@
             app:title="@string/battery_optimization"
             app:summary="@string/battery_optimization_summary" />
         <Preference
+            app:key="pref_all_files_access"
+            app:title="@string/all_files_access"
+            app:summary="@string/all_files_access_summary" />
+        <Preference
             app:key="pref_notification_permission"
             app:title="@string/notification_permission"
             app:summary="@string/notification_permission_summary" />
