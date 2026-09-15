@@ -6,6 +6,16 @@ import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 
+// FNV-1a over the pixel words with an extra shift for diffusion. The previous checksum was a
+// miscoded Adler-32 that swapped its halves every step and fed signed pixels through a signed
+// remainder, which made it a weaker change detector than intended.
+internal const val TILE_HASH_SEED = 0x811C9DC5.toInt()
+
+internal fun tileHash(pixel: Int, state: Int): Int {
+    val h = (state xor pixel) * 16777619
+    return h xor (h ushr 15)
+}
+
 class DesktopFrameEncoder {
     private var tilesWide: Int = 0
     private var tilesHigh: Int = 0
@@ -14,7 +24,7 @@ class DesktopFrameEncoder {
     private var tilesCount: Int = 0
     private var oldcrcs: IntArray? = null
     private var newcrcs: IntArray? = null
-    // Reused per-tile pixel scratch, so a full-screen CRC pass doesn't allocate one array per tile.
+    // Reused per-tile pixel scratch, so a full-screen hash pass doesn't allocate one array per tile.
     private val tilePixels = IntArray(64 * 64)
     // Written from the tunnel/main thread, read on the capture thread.
     @Volatile private var forceFullFrame = true
@@ -35,7 +45,7 @@ class DesktopFrameEncoder {
             forceFullFrame = true
         }
 
-        computeAllCRCs(bitmap)
+        computeAllHashes(bitmap)
         var changedTiles = 0
         for (i in 0 until tilesCount) {
             if (forceFullFrame || oldcrcs!![i] != newcrcs!![i]) changedTiles++
@@ -43,7 +53,9 @@ class DesktopFrameEncoder {
         if (changedTiles == 0) return false
 
         if (forceFullFrame || ((changedTiles * 100) >= (tilesCount * 85))) {
-            sink(buildImageCommand(bitmap, 0, 0, bitmap.width, bitmap.height))
+            // A failed encode leaves forceFullFrame set, so the next capture retries as a full frame.
+            val command = buildImageCommand(bitmap, 0, 0, bitmap.width, bitmap.height) ?: return false
+            sink(command)
             for (i in 0 until tilesCount) oldcrcs!![i] = newcrcs!![i]
             forceFullFrame = false
             return true
@@ -77,7 +89,6 @@ class DesktopFrameEncoder {
         if (sendx != -1) {
             sendSubBitmapRow(bitmap, sendx, sendy, sendw, sink)
         }
-        forceFullFrame = false
         return true
     }
 
@@ -103,11 +114,17 @@ class DesktopFrameEncoder {
             h++
         }
         h -= y
-        sink(buildImageCommand(bitmap, x * 64, y * 64, w * 64, h * 64))
+        val command = buildImageCommand(bitmap, x * 64, y * 64, w * 64, h * 64)
+        if (command == null) {
+            // These tiles are already marked as sent; resend the whole screen next time instead.
+            forceFullFrame = true
+            return
+        }
+        sink(command)
     }
 
-    private fun computeAllCRCs(bitmap: Bitmap) {
-        for (i in 0 until tilesCount) newcrcs!![i] = 1
+    private fun computeAllHashes(bitmap: Bitmap) {
+        for (i in 0 until tilesCount) newcrcs!![i] = TILE_HASH_SEED
         for (y in 0 until tilesHigh) {
             var h = 64
             if (((y * 64) + 64) > bitmap.height) h = bitmap.height - (y * 64)
@@ -117,23 +134,31 @@ class DesktopFrameEncoder {
                 val t = (y * tilesWide) + x
                 val count = w * h
                 bitmap.getPixels(tilePixels, 0, w, x * 64, y * 64, w, h)
-                var crc = newcrcs!![t]
-                for (i in 0 until count) crc = adler32(tilePixels[i], crc)
-                newcrcs!![t] = crc
+                var hash = newcrcs!![t]
+                for (i in 0 until count) hash = tileHash(tilePixels[i], hash)
+                newcrcs!![t] = hash
             }
         }
     }
 
-    private fun buildImageCommand(bitmap: Bitmap, x: Int, y: Int, w: Int, h: Int): ByteString {
+    // Null when the region can't be encoded, so callers never ship an empty image that would jam
+    // the viewer's in-order tile queue.
+    private fun buildImageCommand(bitmap: Bitmap, x: Int, y: Int, w: Int, h: Int): ByteString? {
         var ww = w
         var hh = h
         if (x + w > bitmap.width) ww = bitmap.width - x
         if (y + h > bitmap.height) hh = bitmap.height - y
-        val croppedBitmap = if (x == 0 && y == 0 && ww == bitmap.width && hh == bitmap.height) {
-            bitmap
-        } else {
-            Bitmap.createBitmap(bitmap, x, y, ww, hh)
+        val croppedBitmap = try {
+            if (x == 0 && y == 0 && ww == bitmap.width && hh == bitmap.height) {
+                bitmap
+            } else {
+                Bitmap.createBitmap(bitmap, x, y, ww, hh)
+            }
+        } catch (ex: Exception) {
+            return null
         }
+        // The screen is opaque; without this PNG and WebP would carry a pointless alpha plane.
+        croppedBitmap.setHasAlpha(false)
 
         val bytesOut = ByteArrayOutputStream()
         val dos = DataOutputStream(bytesOut)
@@ -144,19 +169,24 @@ class DesktopFrameEncoder {
         dos.writeShort(0)
         dos.writeShort(x)
         dos.writeShort(y)
-        when (g_desktop_imageType) {
-            4 -> {
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-                    croppedBitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, g_desktop_compressionLevel, dos)
-                } else {
-                    @Suppress("DEPRECATION")
-                    croppedBitmap.compress(Bitmap.CompressFormat.WEBP, g_desktop_compressionLevel, dos)
+        val encoded = try {
+            when (g_desktop_imageType) {
+                4 -> {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                        croppedBitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, g_desktop_compressionLevel, dos)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        croppedBitmap.compress(Bitmap.CompressFormat.WEBP, g_desktop_compressionLevel, dos)
+                    }
                 }
+                2 -> croppedBitmap.compress(Bitmap.CompressFormat.PNG, g_desktop_compressionLevel, dos)
+                else -> croppedBitmap.compress(Bitmap.CompressFormat.JPEG, g_desktop_compressionLevel, dos)
             }
-            2 -> croppedBitmap.compress(Bitmap.CompressFormat.PNG, g_desktop_compressionLevel, dos)
-            else -> croppedBitmap.compress(Bitmap.CompressFormat.JPEG, g_desktop_compressionLevel, dos)
+        } catch (ex: Exception) {
+            false
         }
         if (croppedBitmap !== bitmap) croppedBitmap.recycle()
+        if (!encoded) return null
 
         val data = bytesOut.toByteArray()
         val cmdSize = data.size - 8
@@ -165,13 +195,5 @@ class DesktopFrameEncoder {
         data[6] = (cmdSize shr 8).toByte()
         data[7] = cmdSize.toByte()
         return data.toByteString()
-    }
-
-    private fun adler32(n: Int, state: Int): Int {
-        var a = state shr 16
-        var b = state and 0xFFFF
-        a = (a + n) % 65521
-        b = (b + a) % 65521
-        return (b shl 16) + a
     }
 }

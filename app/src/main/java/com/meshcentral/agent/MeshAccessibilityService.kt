@@ -2,24 +2,29 @@ package com.meshcentral.agent
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.accessibilityservice.InputMethod
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Path
+import android.graphics.Rect
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Display
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.annotation.RequiresApi
 import okio.ByteString
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.absoluteValue
 import kotlin.math.max
 import kotlin.math.min
 
@@ -37,6 +42,9 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     @Volatile private var nextFrameDelayMs = MIN_FRAME_DELAY_MS
     @Volatile private var screenshotErrorNotified = false
     @Volatile private var lastCaptureUptimeMs = 0L
+    // Each screenshot request gets a sequence number; a late or duplicate answer for an older
+    // request is dropped so it can't paint over a newer frame.
+    @Volatile private var captureSequence = 0
 
     // Pointer input is streamed as continued strokes: button down puts a finger on the screen,
     // each move drags it and button up lifts it. Drags happen live, holding the button is a long
@@ -62,6 +70,23 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     // What the operator typed into the focused password field; Android masks the field's own text.
     private val passwordBuffer = StringBuilder()
     private var passwordNodeKey: String? = null
+    // Modifier keys arrive as their own key messages; remembered for shortcuts and shift-selection.
+    private var shiftHeld = false
+    private var ctrlHeld = false
+    private var altHeld = false
+    // The last text written to a field with SET_TEXT, used while the app is still applying it.
+    private var shadowNodeKey: String? = null
+    private var shadowText: String? = null
+    private var shadowCursor = 0
+    private var shadowUptimeMs = 0L
+    // Mouse-style text selection in progress (see beginDragSelect).
+    private var dragSelectNode: AccessibilityNodeInfo? = null
+    private var dragSelectRects: List<RectF?>? = null
+    private var dragSelectAnchor = -1
+    private var dragSelectLastFocus = -1
+    private var dragSelectActive = false
+    private var dragDownX = 0
+    private var dragDownY = 0
 
     override val isRunning: Boolean
         get() = active
@@ -122,6 +147,9 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         active = false
         mainHandler.removeCallbacks(captureRunnable)
         releaseHeldPointer()
+        shiftHeld = false
+        ctrlHeld = false
+        altHeld = false
         if (g_remoteDesktopProvider === this) {
             g_remoteDesktopProvider = null
         }
@@ -218,6 +246,10 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                         // A second down without an up means the release was lost: lift, then redo it.
                         inputSteps.addFirst(step)
                         liftPointer(heldX.toInt(), heldY.toInt())
+                    } else if (beginDragSelect(step.x, step.y)) {
+                        // Nothing touches the screen yet: a move makes this a selection, a release
+                        // becomes a tap, and a hold becomes a real press once the deferral expires.
+                        mainHandler.postDelayed(deferredPress, DRAG_SELECT_DEFER_MS)
                     } else {
                         pressPointer(step.x, step.y)
                     }
@@ -228,11 +260,33 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                     while (inputSteps.firstOrNull() is InputStep.Move) {
                         move = inputSteps.removeFirst() as InputStep.Move
                     }
-                    if (heldStroke != null && (move.x.toFloat() != heldX || move.y.toFloat() != heldY)) {
+                    if (dragSelectActive) {
+                        updateDragSelect(move.x, move.y)
+                    } else if (dragSelectNode != null) {
+                        if ((move.x - dragDownX).absoluteValue > DRAG_SELECT_SLOP || (move.y - dragDownY).absoluteValue > DRAG_SELECT_SLOP) {
+                            mainHandler.removeCallbacks(deferredPress)
+                            dragSelectActive = true
+                            println("dragSelect: selecting from offset $dragSelectAnchor")
+                            updateDragSelect(move.x, move.y)
+                        }
+                    } else if (heldStroke != null && (move.x.toFloat() != heldX || move.y.toFloat() != heldY)) {
                         movePointer(move.x, move.y)
                     }
                 }
-                is InputStep.Up -> if (heldStroke != null) liftPointer(step.x, step.y)
+                is InputStep.Up -> {
+                    if (dragSelectNode != null && !dragSelectActive) {
+                        // Released without moving: deliver the click as a tap now.
+                        val x = dragDownX
+                        val y = dragDownY
+                        endDragSelect()
+                        recentTapUptimes.addLast(SystemClock.uptimeMillis())
+                        while (recentTapUptimes.size > 4) recentTapUptimes.removeFirst()
+                        tapGesture(x, y)?.let { dispatchQueued(it) }
+                    } else {
+                        endDragSelect()
+                        if (heldStroke != null) liftPointer(step.x, step.y)
+                    }
+                }
                 is InputStep.DoubleTap -> {
                     // The viewer sends both clicks as down/up pairs before this flag, so only
                     // synthesize the taps when they didn't come through.
@@ -341,10 +395,9 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         return accepted
     }
 
-    // Both callbacks are created on first use: instantiating them in a field initializer would
-    // reference classes older Android releases lack and crash the service as it binds.
+    // Created on first use: instantiating it in a field initializer would reference a class older
+    // Android releases lack and crash the service as it binds.
     private var gestureCallback: AccessibilityService.GestureResultCallback? = null
-    private var screenshotCallback: AccessibilityService.TakeScreenshotCallback? = null
 
     @RequiresApi(Build.VERSION_CODES.N)
     private inner class GestureCallback : AccessibilityService.GestureResultCallback() {
@@ -371,6 +424,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     private fun releaseHeldPointer() {
         mainHandler.post {
             inputSteps.clear()
+            endDragSelect()
             if (heldStroke != null) {
                 inputSteps.addLast(InputStep.Up(heldX.toInt(), heldY.toInt()))
                 pumpInput()
@@ -408,18 +462,40 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         if (!active || capturing || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         capturing = true
         lastCaptureUptimeMs = SystemClock.uptimeMillis()
+        val sequence = ++captureSequence
+        mainHandler.removeCallbacks(captureWatchdog)
+        mainHandler.postDelayed(captureWatchdog, CAPTURE_WATCHDOG_MS)
         try {
-            val callback = screenshotCallback ?: ScreenshotCallback().also { screenshotCallback = it }
-            takeScreenshot(Display.DEFAULT_DISPLAY, captureExecutor, callback)
+            takeScreenshot(Display.DEFAULT_DISPLAY, captureExecutor, ScreenshotCallback(sequence))
         } catch (ex: Exception) {
-            capturing = false
+            captureFinished(sequence)
             scheduleNextCapture()
         }
     }
 
+    // Android occasionally never answers a screenshot request; without this the loop would stop
+    // for the rest of the session.
+    private val captureWatchdog = Runnable {
+        if (!capturing) return@Runnable
+        println("takeScreenshot did not answer, retrying")
+        captureSequence++
+        capturing = false
+        scheduleNextCapture()
+    }
+
+    private fun captureFinished(sequence: Int) {
+        if (sequence != captureSequence) return
+        mainHandler.removeCallbacks(captureWatchdog)
+        capturing = false
+    }
+
     @RequiresApi(Build.VERSION_CODES.R)
-    private inner class ScreenshotCallback : AccessibilityService.TakeScreenshotCallback {
+    private inner class ScreenshotCallback(private val sequence: Int) : AccessibilityService.TakeScreenshotCallback {
         override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+            if (sequence != captureSequence) {
+                screenshot.hardwareBuffer.close()
+                return
+            }
             // Recovered: allow the next error to be reported again.
             screenshotErrorNotified = false
             var bitmap: Bitmap? = null
@@ -458,13 +534,14 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                 if (encodedBitmap != null && encodedBitmap !== bitmap) encodedBitmap.recycle()
                 bitmap?.recycle()
                 screenshot.hardwareBuffer.close()
-                capturing = false
+                captureFinished(sequence)
                 scheduleNextCapture()
             }
         }
 
         override fun onFailure(errorCode: Int) {
-            capturing = false
+            if (sequence != captureSequence) return
+            captureFinished(sequence)
             if (errorCode == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
                 // We asked too soon; retry at the throttle interval rather than backing off toward idle.
                 scheduleNextCapture()
@@ -501,16 +578,24 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
 
     private fun handleLegacyKey(msg: ByteString): Boolean {
         if (msg.size < 6) return false
-        val action = u(msg[4])
+        val down = u(msg[4]) == 0
         val keyCode = u(msg[5])
-        if (action != 0) return true
         when (keyCode) {
-            8 -> return backspaceFocused() || (keyguardLocked() && keyguardKey("delete_button", null))
-            13 -> return enterFocused()
-            37 -> return moveFocusedCursor(-1)
-            39 -> return moveFocusedCursor(1)
-            38 -> return moveFocusedCursorLine(-1)
-            40 -> return moveFocusedCursorLine(1)
+            16 -> { shiftHeld = down; return true }
+            17 -> { ctrlHeld = down; return true }
+            18 -> { altHeld = down; return true }
+        }
+        if (!down) return true
+        if (ctrlHeld) return handleShortcut(keyCode)
+        when (keyCode) {
+            8 -> return (keyguardLocked() && keyguardKey("delete_button", null)) || editorKey(KeyEvent.KEYCODE_DEL) || backspaceFocused()
+            9 -> if (editorKey(KeyEvent.KEYCODE_TAB)) return true
+            13 -> return (keyguardLocked() && keyguardKey("key_enter", null)) || editorKey(KeyEvent.KEYCODE_ENTER) || enterFocused()
+            46 -> return editorKey(KeyEvent.KEYCODE_FORWARD_DEL) || deleteForwardFocused()
+            37 -> return editorKey(KeyEvent.KEYCODE_DPAD_LEFT) || moveFocusedCursor(-1)
+            39 -> return editorKey(KeyEvent.KEYCODE_DPAD_RIGHT) || moveFocusedCursor(1)
+            38 -> return editorKey(KeyEvent.KEYCODE_DPAD_UP) || moveFocusedCursorLine(-1)
+            40 -> return editorKey(KeyEvent.KEYCODE_DPAD_DOWN) || moveFocusedCursorLine(1)
             27 -> return globalAction(GLOBAL_ACTION_BACK)
             36 -> return globalAction(GLOBAL_ACTION_HOME)
             93 -> return globalAction(GLOBAL_ACTION_RECENTS)
@@ -575,9 +660,208 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         val ch = readShort(msg, 5).toChar()
         // Lock screen PIN pad: no editable field, so press its buttons by hand.
         if (ch.isDigit() && keyguardLocked() && focusedEditable() == null && keyguardKey("key$ch", ch.toString())) return true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val connection = editorConnection()
+            if (connection != null) {
+                connection.commitText(ch.toString(), 1, null)
+                return true
+            }
+        }
         return insertFocused(ch.toString()).also {
             if (!it) notifyUnsupportedKeyboard()
         }
+    }
+
+    // Android 13+ lets an accessibility service act as an input method: an InputConnection keeps
+    // keystrokes in order and offers the editor's own key handling and shortcuts, so nothing is
+    // dropped when the operator types fast. Null without an active text field or on older releases.
+    private fun editorConnection(): InputMethod.AccessibilityInputConnection? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
+        // The connection can outlive the field it belonged to (the lock screen's PIN pad is one
+        // case), so only trust it while a text field actually has input focus.
+        if (focusedEditable() == null) return null
+        return try {
+            inputMethod?.currentInputConnection
+        } catch (ex: Exception) {
+            null
+        }
+    }
+
+    // A hardware-style key press with the held modifiers, through the input connection.
+    private fun editorKey(keyCode: Int): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        val connection = editorConnection() ?: return false
+        val meta = currentMeta()
+        val now = SystemClock.uptimeMillis()
+        connection.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, meta))
+        connection.sendKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0, meta))
+        return true
+    }
+
+    private fun currentMeta(): Int {
+        var meta = 0
+        if (shiftHeld) meta = meta or KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+        if (ctrlHeld) meta = meta or KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+        if (altHeld) meta = meta or KeyEvent.META_ALT_ON or KeyEvent.META_ALT_LEFT_ON
+        return meta
+    }
+
+    // Ctrl shortcuts: the editor's own select-all, copy, cut and paste where an input connection
+    // exists, node actions otherwise; any other combination goes through as a key with Ctrl held.
+    private fun handleShortcut(keyCode: Int): Boolean {
+        val menuId = when (keyCode) {
+            65 -> android.R.id.selectAll
+            67 -> android.R.id.copy
+            86 -> android.R.id.paste
+            88 -> android.R.id.cut
+            else -> 0
+        }
+        if (menuId != 0) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val connection = editorConnection()
+                if (connection != null) {
+                    connection.performContextMenuAction(menuId)
+                    return true
+                }
+            }
+            val node = focusedEditable() ?: return true
+            return when (keyCode) {
+                65 -> setSelectionRange(node, 0, fieldText(node).length)
+                67 -> node.performAction(AccessibilityNodeInfo.ACTION_COPY)
+                86 -> node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                else -> node.performAction(AccessibilityNodeInfo.ACTION_CUT)
+            }
+        }
+        val androidKey = when (keyCode) {
+            in 65..90 -> KeyEvent.KEYCODE_A + (keyCode - 65)
+            37 -> KeyEvent.KEYCODE_DPAD_LEFT
+            39 -> KeyEvent.KEYCODE_DPAD_RIGHT
+            38 -> KeyEvent.KEYCODE_DPAD_UP
+            40 -> KeyEvent.KEYCODE_DPAD_DOWN
+            8 -> KeyEvent.KEYCODE_DEL
+            46 -> KeyEvent.KEYCODE_FORWARD_DEL
+            else -> 0
+        }
+        if (androidKey != 0) editorKey(androidKey)
+        return true
+    }
+
+    // A drag that starts on the focused text field selects text, as a mouse does on a desktop,
+    // instead of the touch behaviour of moving the caret. The field's character bounds are
+    // fetched once per drag and matched against the pointer; fields that don't report them (some
+    // web views) keep the touch behaviour.
+    private fun beginDragSelect(x: Int, y: Int): Boolean {
+        endDragSelect()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+        val node = focusedEditable() ?: return false
+        if (node.isPassword) return false
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        if (!bounds.contains(x, y)) return false
+        val rects = characterBounds(node)
+        if (rects == null) {
+            println("dragSelect: field reports no character bounds")
+            return false
+        }
+        val anchor = offsetAt(rects, x, y)
+        if (anchor == null) {
+            println("dragSelect: no text offset at $x,$y")
+            return false
+        }
+        dragSelectNode = node
+        dragSelectRects = rects
+        dragSelectAnchor = anchor
+        dragSelectLastFocus = anchor
+        dragDownX = x
+        dragDownY = y
+        return true
+    }
+
+    private fun updateDragSelect(x: Int, y: Int) {
+        val node = dragSelectNode ?: return
+        val rects = dragSelectRects ?: return
+        val focus = offsetAt(rects, x, y) ?: return
+        if (focus == dragSelectLastFocus) return
+        dragSelectLastFocus = focus
+        if (!setSelectionRange(node, dragSelectAnchor, focus)) println("dragSelect: selection $dragSelectAnchor..$focus refused")
+    }
+
+    private fun endDragSelect() {
+        mainHandler.removeCallbacks(deferredPress)
+        dragSelectNode = null
+        dragSelectRects = null
+        dragSelectActive = false
+    }
+
+    // The pointer is still held on the text field with no movement: it was a press after all, so
+    // put the finger down now (a long press follows if it stays).
+    private val deferredPress = object : Runnable {
+        override fun run() {
+            if (dragSelectNode == null || dragSelectActive) return
+            if (gestureInFlight) {
+                mainHandler.postDelayed(this, 20)
+                return
+            }
+            val x = dragDownX
+            val y = dragDownY
+            endDragSelect()
+            pressPointer(x, y)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun characterBounds(node: AccessibilityNodeInfo): List<RectF?>? {
+        val length = min(fieldText(node).length, AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_ARG_MAX_LENGTH)
+        if (length == 0) return null
+        val args = Bundle()
+        args.putInt(AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_ARG_START_INDEX, 0)
+        args.putInt(AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_ARG_LENGTH, length)
+        val fetched = try {
+            node.refreshWithExtraData(AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_KEY, args)
+        } catch (ex: Exception) {
+            false
+        }
+        if (!fetched) return null
+        val array = node.extras.getParcelableArray(AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_KEY) ?: return null
+        val rects = array.map { it as? RectF }
+        return if (rects.any { it != null }) rects else null
+    }
+
+    // Text offset for a screen point: the nearest line by vertical distance, then the character
+    // whose bounds hold x, with the caret after it when x is past its middle.
+    private fun offsetAt(rects: List<RectF?>, x: Int, y: Int): Int? {
+        var lineTop = 0f
+        var lineBottom = 0f
+        var best = Float.MAX_VALUE
+        for (r in rects) {
+            if (r == null) continue
+            val distance = when {
+                y < r.top -> r.top - y
+                y > r.bottom -> y - r.bottom
+                else -> 0f
+            }
+            if (distance < best) {
+                best = distance
+                lineTop = r.top
+                lineBottom = r.bottom
+            }
+        }
+        if (best == Float.MAX_VALUE) return null
+        var firstIndex = -1
+        var lastIndex = -1
+        var firstLeft = 0f
+        for ((i, r) in rects.withIndex()) {
+            if (r == null || (r.top - lineTop).absoluteValue > 0.5f || (r.bottom - lineBottom).absoluteValue > 0.5f) continue
+            if (firstIndex < 0) {
+                firstIndex = i
+                firstLeft = r.left
+            }
+            lastIndex = i
+            if (x >= r.left && x <= r.right) return if (x < r.centerX()) i else i + 1
+        }
+        if (firstIndex < 0) return null
+        return if (x < firstLeft) firstIndex else lastIndex + 1
     }
 
     private fun keyguardLocked(): Boolean {
@@ -673,37 +957,70 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         return if (s <= e) Pair(s, e) else Pair(e, s)
     }
 
-    private fun setCursor(node: AccessibilityNodeInfo, pos: Int): Boolean {
+    private fun setCursor(node: AccessibilityNodeInfo, pos: Int): Boolean = setSelectionRange(node, pos, pos)
+
+    // TextView rejects a selection whose start is past its end, so order the two.
+    private fun setSelectionRange(node: AccessibilityNodeInfo, start: Int, end: Int): Boolean {
         val args = Bundle()
-        args.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, pos)
-        args.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, pos)
+        args.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, min(start, end))
+        args.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, max(start, end))
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
     }
+
+    private fun nodeKey(node: AccessibilityNodeInfo): String = "${node.windowId}:${node.hashCode()}"
 
     private fun replaceText(node: AccessibilityNodeInfo, text: String, cursor: Int): Boolean {
         val args = Bundle()
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
         setCursor(node, cursor)
+        shadowNodeKey = nodeKey(node)
+        shadowText = text
+        shadowCursor = cursor
+        shadowUptimeMs = SystemClock.uptimeMillis()
         return true
+    }
+
+    // The field's text and selection, or the text of a write the app hasn't applied yet: a
+    // keystroke that read the stale text would rebuild from it and drop the previous character.
+    private fun fieldState(node: AccessibilityNodeInfo): Pair<String, Pair<Int, Int>> {
+        val text = fieldText(node)
+        val shadow = shadowText
+        if (shadow != null && shadowNodeKey == nodeKey(node) && text != shadow &&
+            SystemClock.uptimeMillis() - shadowUptimeMs < SHADOW_TEXT_MS) {
+            return Pair(shadow, Pair(shadowCursor, shadowCursor))
+        }
+        return Pair(text, selectionRange(node, text.length))
     }
 
     private fun insertFocused(insert: String): Boolean {
         val node = focusedEditable() ?: return false
         if (node.isPassword) return typeIntoPassword(node, insert)
-        val text = fieldText(node)
-        val (s, e) = selectionRange(node, text.length)
+        val (text, selection) = fieldState(node)
+        val (s, e) = selection
         return replaceText(node, text.substring(0, s) + insert + text.substring(e), s + insert.length)
     }
 
     private fun backspaceFocused(): Boolean {
         val node = focusedEditable() ?: return false
         if (node.isPassword) return typeIntoPassword(node, null)
-        val text = fieldText(node)
-        val (s, e) = selectionRange(node, text.length)
+        val (text, selection) = fieldState(node)
+        val (s, e) = selection
         return when {
             s != e -> replaceText(node, text.substring(0, s) + text.substring(e), s)
             s > 0 -> replaceText(node, text.substring(0, s - 1) + text.substring(s), s - 1)
+            else -> true
+        }
+    }
+
+    private fun deleteForwardFocused(): Boolean {
+        val node = focusedEditable() ?: return false
+        if (node.isPassword) return false
+        val (text, selection) = fieldState(node)
+        val (s, e) = selection
+        return when {
+            s != e -> replaceText(node, text.substring(0, s) + text.substring(e), s)
+            e < text.length -> replaceText(node, text.substring(0, e) + text.substring(e + 1), e)
             else -> true
         }
     }
@@ -712,6 +1029,12 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         val node = focusedEditable() ?: return true
         val text = fieldText(node)
         val (s, e) = selectionRange(node, text.length)
+        if (shiftHeld) {
+            // Extend from the anchor, which Android keeps as the selection start.
+            val anchor = node.textSelectionStart.coerceIn(0, text.length)
+            val focus = (node.textSelectionEnd.coerceIn(0, text.length) + delta).coerceIn(0, text.length)
+            return setSelectionRange(node, anchor, focus)
+        }
         // A selection collapses to its near edge; otherwise step one character.
         val pos = when {
             s != e && delta < 0 -> s
@@ -739,6 +1062,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                 (lineEnd + 1 + col).coerceAtMost(nextEnd)
             }
         }
+        if (shiftHeld) return setSelectionRange(node, node.textSelectionStart.coerceIn(0, text.length), pos)
         return setCursor(node, pos)
     }
 
@@ -797,5 +1121,9 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         private const val HOME_SETTLE_MS = 450L
         private const val APP_DRAWER_SWIPE_MS = 300L
         private const val KEYGUARD_NOTICE_S = 45
+        private const val CAPTURE_WATCHDOG_MS = 4_000L
+        private const val DRAG_SELECT_SLOP = 8
+        private const val DRAG_SELECT_DEFER_MS = 300L
+        private const val SHADOW_TEXT_MS = 800L
     }
 }

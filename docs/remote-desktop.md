@@ -62,7 +62,7 @@ available frame, the service:
 1. Acquires the latest image instead of processing every queued frame.
 2. Optionally scales the image to the size requested by MeshCentral.
 3. Divides the image into 64 by 64 pixel tiles.
-4. Calculates an Adler-32 value for each tile and compares it with the previous
+4. Hashes each tile (FNV-1a over the pixels) and compares it with the previous
    frame.
 5. Sends changed rectangular regions. If at least 85 percent of the tiles have
    changed, it sends the complete image instead.
@@ -128,14 +128,18 @@ the release lifts it, so the device reacts as it would to a real touch:
 | --- | --- |
 | Click | Tap |
 | Press and hold | Long press (context menus, text selection) |
-| Drag | Live drag: scrolling, selection handles, moving icons after a long press |
+| Drag | Live drag: scrolling, moving icons after a long press; on the focused text field it selects text as a mouse would |
 | Double-click | Double tap |
 | Mouse wheel | Swipe up or down under the cursor |
 | Right-click | Back |
 | Middle-click | Home |
 
-Keyboard input is limited to the focused editable field plus Backspace, Enter,
-and arrow navigation. The on-screen panel buttons map to Android global actions
+Keyboard input goes to the focused text field: characters, Backspace, Delete,
+Enter, Tab, arrows with Shift to extend the selection, and Ctrl with A, C, X or
+V. On Android 13+ this runs through the system input method, so fast typing is
+kept in order; older releases rewrite the field's text and guard against a
+keystroke arriving before the previous one was applied. The on-screen panel
+buttons map to Android global actions
 (Back, Home, Recents, notifications, quick settings, lock, power). The Apps
 button uses the Android 14+ accessibility all-apps action when the launcher
 honours it and otherwise goes Home and swipes up, which opens the app drawer on
