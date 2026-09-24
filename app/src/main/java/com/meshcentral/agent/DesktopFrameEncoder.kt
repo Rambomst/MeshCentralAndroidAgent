@@ -26,11 +26,10 @@ class DesktopFrameEncoder {
     private var newcrcs: IntArray? = null
     // Reused per-tile pixel scratch, so a full-screen hash pass doesn't allocate one array per tile.
     private val tilePixels = IntArray(64 * 64)
-    // Written from the tunnel/main thread, read on the capture thread.
-    @Volatile private var forceFullFrame = true
+    private val refreshState = FrameRefreshState()
 
     fun requestFullFrame() {
-        forceFullFrame = true
+        refreshState.request()
     }
 
     fun encode(bitmap: Bitmap, sink: (ByteString) -> Unit): Boolean {
@@ -42,22 +41,23 @@ class DesktopFrameEncoder {
             tilesCount = tilesWide * tilesHigh
             oldcrcs = IntArray(tilesCount)
             newcrcs = IntArray(tilesCount)
-            forceFullFrame = true
+            refreshState.request()
         }
 
+        val refresh = refreshState.pending()
         computeAllHashes(bitmap)
         var changedTiles = 0
         for (i in 0 until tilesCount) {
-            if (forceFullFrame || oldcrcs!![i] != newcrcs!![i]) changedTiles++
+            if (refresh != null || oldcrcs!![i] != newcrcs!![i]) changedTiles++
         }
         if (changedTiles == 0) return false
 
-        if (forceFullFrame || ((changedTiles * 100) >= (tilesCount * 85))) {
-            // A failed encode leaves forceFullFrame set, so the next capture retries as a full frame.
+        if (refresh != null || ((changedTiles * 100) >= (tilesCount * 85))) {
             val command = buildImageCommand(bitmap, 0, 0, bitmap.width, bitmap.height) ?: return false
             sink(command)
             for (i in 0 until tilesCount) oldcrcs!![i] = newcrcs!![i]
-            forceFullFrame = false
+            // A request arriving during encoding still needs its own full frame.
+            if (refresh != null) refreshState.delivered(refresh)
             return true
         }
 
@@ -117,7 +117,7 @@ class DesktopFrameEncoder {
         val command = buildImageCommand(bitmap, x * 64, y * 64, w * 64, h * 64)
         if (command == null) {
             // These tiles are already marked as sent; resend the whole screen next time instead.
-            forceFullFrame = true
+            refreshState.request()
             return
         }
         sink(command)

@@ -325,7 +325,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         sendServerImageRequest()
 
         // Send battery state
-        if (_webSocket != null) { _webSocket?.send(getSysBatteryInfo().toString().toByteArray().toByteString()) }
+        getSysBatteryInfo()?.let { _webSocket?.send(encodeAgentJson(it)) }
     }
 
     // Cause some data to be sent over the websocket control channel every 2 minutes to keep it open
@@ -357,7 +357,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
                     val r = JSONObject()
                     r.put("action", "pong")
                     if (_webSocket != null) {
-                        _webSocket?.send(r.toString().toByteArray().toByteString())
+                        _webSocket?.send(encodeAgentJson(r))
                     }
                 }
                 "pong" -> {
@@ -384,7 +384,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
                         r.put("data", t)
                         //println(r.toString())
                         if (_webSocket != null) {
-                            _webSocket?.send(r.toString().toByteArray().toByteString())
+                            _webSocket?.send(encodeAgentJson(r))
                         }
                     }
                 }
@@ -549,7 +549,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         r.put("action", "software")
         r.put("value", value.toString())
         r.put("sessionid", json.optString("sessionid"))
-        if (_webSocket != null) { _webSocket?.send(r.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(r)) }
     }
 
     // Every app with a launcher entry, which the manifest queries for; that covers what a user
@@ -612,7 +612,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         r.put("sessionid", json.optString("sessionid"))
         r.put("data", text)
         if (tag != null) r.put("tag", tag)
-        if (_webSocket != null) { _webSocket?.send(r.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(r)) }
     }
 
     private fun receiveClipboard(json: JSONObject) {
@@ -624,7 +624,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         r.put("type", "setclip")
         r.put("sessionid", json.optString("sessionid"))
         r.put("success", ok)
-        if (_webSocket != null) { _webSocket?.send(r.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(r)) }
     }
 
     private fun readClipboardText(): String? {
@@ -657,7 +657,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         r.put("value", "Android Agent v${BuildConfig.VERSION_NAME}")
         r.put("caps", 13) // Capability bitmask: 1 = Desktop, 2 = Terminal, 4 = Files, 8 = Console, 16 = JavaScript, 32 = Temporary Agent, 64 = Recovery Agent
         if (pushMessagingToken != null) { r.put("pmt", pushMessagingToken) }
-        if (_webSocket != null) { _webSocket?.send(r.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(r)) }
     }
 
     // Send 2FA authentication URL and approval/reject back
@@ -666,7 +666,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         r.put("action", "2faauth")
         r.put("url", url.toString())
         r.put("approved", approved)
-        if (_webSocket != null) { _webSocket?.send(r.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(r)) }
     }
 
     // Request user image and real name if needed
@@ -680,7 +680,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
             r.put("action", "getUserImage")
             r.put("userid", userid)
             if (_webSocket != null) {
-                _webSocket?.send(r.toString().toByteArray().toByteString())
+                _webSocket?.send(encodeAgentJson(r))
             }
         }
     }
@@ -691,7 +691,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         r.put("action", "getServerImage")
         r.put("agent", "android")
         if (_webSocket != null) {
-            _webSocket?.send(r.toString().toByteArray().toByteString())
+            _webSocket?.send(encodeAgentJson(r))
         }
     }
 
@@ -722,7 +722,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         val r = JSONObject()
         r.put("action", "netinfo")
         r.put("netif2", netinfo)
-        if (_webSocket != null) {_webSocket?.send(r.toString().toByteArray().toByteString()); return true }
+        if (_webSocket != null) {_webSocket?.send(encodeAgentJson(r)); return true }
         return false
     }
 
@@ -806,7 +806,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
 
             // Battery state changed, send update to the server
             lastBattState = battState
-            if (_webSocket != null) { _webSocket?.send(battState.toString().toByteArray().toByteString()) }
+            if (_webSocket != null) { _webSocket?.send(encodeAgentJson(battState)) }
         }
     }
 
@@ -1128,7 +1128,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
         json.put("type", "console")
         json.put("value", r)
         if (sessionid != null) { json.put("sessionid", sessionid) }
-        if (_webSocket != null) { _webSocket?.send(json.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(json)) }
     }
 
     fun hexToByteArray(hex: String) : ByteArray {
@@ -1156,7 +1156,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
                 if (!soptions.isNull("sessionid")) { json.put("sessionid", soptions.optString("sessionid")) }
             }
         }
-        if (_webSocket != null) { _webSocket?.send(json.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(json)) }
     }
 
     fun logServerEventEx(id: Int, args: JSONArray?, msg: String, jsoncmd: JSONObject?) {
@@ -1176,7 +1176,7 @@ class MeshAgent(parent: AgentHost, host: String, certHash: String, devGroupId: S
                 if (!soptions.isNull("sessionid")) { json.put("sessionid", soptions.optString("sessionid")) }
             }
         }
-        if (_webSocket != null) { _webSocket?.send(json.toString().toByteArray().toByteString()) }
+        if (_webSocket != null) { _webSocket?.send(encodeAgentJson(json)) }
     }
 
 }

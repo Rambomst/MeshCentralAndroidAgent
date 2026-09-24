@@ -41,6 +41,7 @@ time.
 
 - [Repository overview](overview.md) - architecture, components, configuration,
   data flows, and development notes.
+- [Testing](testing.md) - portable checks, reports, and coverage limits.
 - [Remote desktop](remote-desktop.md) - screen capture, consent, encoding, and
   Android platform limitations.
 - [Tunnel authentication](tunnel-authentication.md) - control-channel

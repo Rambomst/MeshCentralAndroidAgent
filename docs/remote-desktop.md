@@ -90,17 +90,21 @@ permission. The agent cannot grant it to itself. Starting projection opens a
 system-owned dialog, and capture starts only if the local device user approves
 it.
 
-The setting currently labeled **Automatic consent** does not provide privileged
-or silent approval. Enabling it immediately asks Android to start projection.
-Once the user approves, the agent keeps that projection service active when the
-last viewer disconnects, allowing later viewers to reuse the active capture
-session without another prompt. With the setting disabled, projection stops
-when the final remote desktop tunnel closes.
+**Automatic consent** skips the agent's approval prompt only when the server's
+consent policy also permits it. It does not grant Android accessibility or
+MediaProjection permission. Each desktop or Files-tab session has its own
+approval, including additional viewers joining an existing capture session.
+Desktop frames and input are blocked until that session is approved. View-only
+sessions cannot send pointer, keyboard, touch, or Android action commands.
 
-Prompts also follow the server's consent flags: with automatic consent on, a
-session whose policy sets the desktop or files prompt bit still asks the device
-user, and a prompt expires after the server's consent timeout (30 seconds by
-default) as a denial unless the server allows auto-accept on timeout.
+Prompts are shown one at a time. Dialogs, notification actions, and timeouts refer
+to a specific request, so a delayed response cannot approve another session.
+Each request expires after the server's consent timeout (30 seconds by default)
+as a denial unless the server allows auto-accept on timeout. Files-tab commands
+wait for approval and then run in arrival order on one worker.
+
+Capture starts only for an approved desktop session and stops when the last
+approved desktop session disconnects. Pending requests do not keep capture alive.
 
 Projection also stops when the user stops sharing through Android, the app asks
 the service to stop, the agent is disconnected, the process is terminated, or

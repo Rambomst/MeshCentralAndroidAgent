@@ -104,8 +104,9 @@ object AgentController : AgentHost {
     private var projectionRetryRunnable: Runnable? = null
     private var projectionRetryCount = 0
     // Consent prompts expire like the other agents' do: the server's timeout, 30 s by default.
-    private var desktopConsentTimeout: Runnable? = null
-    private var filesConsentTimeout: Runnable? = null
+    private val consentRequests = ConsentRequests<MeshTunnel>()
+    private val consentTimeouts = mutableMapOf<String, Runnable>()
+    private var displayedConsentId: String? = null
     private var screenWakeLock: PowerManager.WakeLock? = null
     @Volatile private var screenAwakeUntilUptimeMs = 0L
     private val MAX_PROJECTION_RETRIES = 12
@@ -155,6 +156,12 @@ object AgentController : AgentHost {
         if (activity === mainActivity) {
             activity = null
             g_mainActivity = null
+        }
+    }
+
+    fun activityPaused() {
+        mainHandler.post {
+            if (consentRequests.first() != null) showPendingSessionConsent(force = true)
         }
     }
 
@@ -324,30 +331,13 @@ object AgentController : AgentHost {
 
     private fun startProjectionOnHostThread() {
         if (meshAgent == null || meshAgent?.state != 3) return
-        if (!hasActiveDesktopTunnel()) return
+        if (!hasAuthorizedDesktopTunnel()) return
         keepScreenAwake()
         if (isRemoteDesktopRunning()) return
         val accessibility = MeshAccessibilityService.instance
         if (accessibility != null) {
             cancelProjectionRetry()
-            val tunnel = activeDesktopTunnel()
-            if (tunnel == null || !tunnel.consentPromptRequired()) {
-                if (accessibility.startDesktop()) return
-            } else {
-                // Explicit approval before capturing: the app setting or the server's policy asks for it.
-                val message = tunnel.consentMessage(appContext)
-                val mainActivity = activity
-                val resumed = mainActivity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
-                if (mainActivity != null && resumed) {
-                    mainActivity.promptUnattendedConsent(message)
-                } else {
-                    // No foreground activity to host a dialog, so ask via the notification.
-                    sendDesktopConsentPending()
-                    AgentForegroundService.showConsentNotification(appContext, message)
-                }
-                armDesktopConsentTimeout(tunnel)
-                return
-            }
+            if (accessibility.startDesktop()) return
         } else if (isAccessibilityServiceEnabled() && waitForAccessibilityProjection()) {
             // Unattended access is granted but the accessibility service has not rebound yet (common
             // right after an app update). Wait for it to connect instead of reporting setup as missing.
@@ -355,16 +345,18 @@ object AgentController : AgentHost {
         }
         cancelProjectionRetry()
 
+        if (consentRequests.first() != null) return
+        val tunnel = authorizedDesktopTunnel() ?: return
         val mainActivity = activity
-        if (mainActivity != null) {
+        if (mainActivity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true) {
             if (isAccessibilityServiceEnabled()) {
                 // Accessibility is granted but not currently usable (e.g. pre-Android 11, or it
                 // failed to bind); legacy screen capture is the only remaining option.
-                mainActivity.startMediaProjectionPrompt()
+                mainActivity.startMediaProjectionPrompt(tunnel.consentId)
             } else {
                 // Don't auto-pop Android's screen-capture consent. Offer Accessibility setup first
                 // and make legacy capture an explicit opt-in choice.
-                mainActivity.promptScreenShareChoice()
+                mainActivity.promptScreenShareChoice(tunnel.consentId)
             }
             return
         }
@@ -378,104 +370,102 @@ object AgentController : AgentHost {
         )
     }
 
-    fun confirmUnattendedConsent() {
-        if (::appContext.isInitialized) AgentForegroundService.cancelConsentNotification(appContext)
-        cancelDesktopConsentTimeout()
-        if (meshAgent?.state != 3 || !hasActiveDesktopTunnel() || isRemoteDesktopRunning()) return
-        activeDesktopTunnel()?.let {
-            it.logSessionEvent(30, "Starting remote desktop after local user accepted")
-            it.notifySessionStart()
-        }
-        runOnHostThread { MeshAccessibilityService.instance?.startDesktop() }
-    }
-
-    fun denyUnattendedConsent() {
-        if (::appContext.isInitialized) AgentForegroundService.cancelConsentNotification(appContext)
-        cancelDesktopConsentTimeout()
-        activity?.dismissConsentPrompt(MainActivity.CONSENT_DESKTOP)
-        val tunnel = activeDesktopTunnel() ?: return
-        tunnel.logSessionEvent(34, "Failed to start remote desktop after local user rejected")
-        tunnel.sendConsoleMessage("denied", MeshTunnel.MSGID_CONSENT_DENIED)
-        tunnel.Stop()
-    }
-
-    private fun armDesktopConsentTimeout(tunnel: MeshTunnel) {
-        if (desktopConsentTimeout != null) return
-        val runnable = Runnable {
-            desktopConsentTimeout = null
-            if (tunnel.consentAutoAcceptOnTimeout()) confirmUnattendedConsent() else denyUnattendedConsent()
-        }
-        desktopConsentTimeout = runnable
-        mainHandler.postDelayed(runnable, tunnel.consentTimeoutMs())
-    }
-
-    private fun cancelDesktopConsentTimeout() {
-        desktopConsentTimeout?.let { mainHandler.removeCallbacks(it) }
-        desktopConsentTimeout = null
-    }
-
-    // Files sessions: same approval flow as screen sharing, but nothing to capture, so the tunnel
-    // just holds the viewer's requests until the user answers.
-    fun requestFilesConsent(tunnel: MeshTunnel) {
+    fun desktopSessionApproved(tunnel: MeshTunnel) {
         runOnHostThread {
-            val message = tunnel.consentMessage(appContext)
-            val mainActivity = activity
-            val resumed = mainActivity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true
-            if (mainActivity != null && resumed) {
-                mainActivity.promptFilesConsent(message)
+            if (!tunnel.isDesktopAuthorized) return@runOnHostThread
+            tunnel.applyDesktopSettings()
+            if (isRemoteDesktopRunning()) {
+                tunnel.updateDesktopDisplaySize()
+                requestDesktopRefresh()
+                tunnel.sendConsoleMessage(null)
             } else {
-                AgentForegroundService.showFilesConsentNotification(appContext, message)
-            }
-            if (filesConsentTimeout == null) {
-                val runnable = Runnable {
-                    filesConsentTimeout = null
-                    if (tunnel.consentAutoAcceptOnTimeout()) confirmFilesConsent() else denyFilesConsent()
-                }
-                filesConsentTimeout = runnable
-                mainHandler.postDelayed(runnable, tunnel.consentTimeoutMs())
+                startProjection()
             }
         }
     }
 
-    // Re-shows the dialog after the activity comes back, e.g. the prompt was answered on the
-    // notification's screen or lost to a rotation.
-    fun showPendingFilesConsent() {
-        val tunnel = pendingFilesConsentTunnels().firstOrNull() ?: return
-        activity?.promptFilesConsent(tunnel.consentMessage(appContext))
+    fun requestSessionConsent(tunnel: MeshTunnel) {
+        runOnHostThread {
+            if (!tunnel.isConsentPending || consentRequests.contains(tunnel.consentId)) return@runOnHostThread
+            consentRequests.add(tunnel.consentId, tunnel)
+            val timeout = Runnable {
+                respondToConsent(tunnel.consentId, tunnel.consentAutoAcceptOnTimeout())
+            }
+            consentTimeouts[tunnel.consentId] = timeout
+            mainHandler.postDelayed(timeout, tunnel.consentTimeoutMs())
+            showPendingSessionConsent()
+        }
     }
 
-    fun confirmFilesConsent() {
+    fun respondToConsent(id: String, approved: Boolean) {
         runOnHostThread {
-            clearFilesConsentPrompt()
-            for (t in pendingFilesConsentTunnels()) t.approveFilesConsent()
+            val tunnel = removeConsentRequest(id) ?: return@runOnHostThread
+            if (tunnel.isConsentPending) {
+                if (approved) tunnel.approveConsent() else tunnel.denyConsent()
+            }
+            showPendingSessionConsent()
             refreshInfo()
         }
     }
 
-    fun denyFilesConsent() {
+    private fun removeConsentRequest(id: String): MeshTunnel? {
+        val tunnel = consentRequests.remove(id) ?: return null
+        consentTimeouts.remove(id)?.let { mainHandler.removeCallbacks(it) }
+        if (displayedConsentId == id) {
+            displayedConsentId = null
+            AgentForegroundService.cancelConsentNotification(appContext)
+            AgentForegroundService.cancelFilesConsentNotification(appContext)
+            activity?.dismissConsentPrompt(id)
+        }
+        return tunnel
+    }
+
+    fun showPendingSessionConsent(force: Boolean = false) {
         runOnHostThread {
-            clearFilesConsentPrompt()
-            for (t in pendingFilesConsentTunnels()) t.denyFilesConsent()
+            val tunnel = consentRequests.first()
+            if (tunnel == null) {
+                if (hasAuthorizedDesktopTunnel() && !isRemoteDesktopRunning()) startProjection()
+                return@runOnHostThread
+            }
+            if (!force && displayedConsentId == tunnel.consentId) return@runOnHostThread
+            displayedConsentId = tunnel.consentId
+            val message = tunnel.consentMessage(appContext)
+            val mainActivity = activity
+            if (mainActivity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true) {
+                AgentForegroundService.cancelConsentNotification(appContext)
+                AgentForegroundService.cancelFilesConsentNotification(appContext)
+                if (tunnel.usage == 5) {
+                    mainActivity.promptFilesConsent(message, tunnel.consentId)
+                } else {
+                    mainActivity.promptUnattendedConsent(message, tunnel.consentId)
+                }
+            } else if (tunnel.usage == 5) {
+                AgentForegroundService.showFilesConsentNotification(appContext, message, tunnel.consentId)
+            } else {
+                AgentForegroundService.showConsentNotification(appContext, message, tunnel.consentId)
+            }
         }
     }
 
-    // The waiting tunnel went away on its own (viewer closed it), so drop the prompt.
-    fun filesConsentResolved() {
+    fun sessionClosed(tunnel: MeshTunnel) {
         runOnHostThread {
-            if (pendingFilesConsentTunnels().isEmpty()) clearFilesConsentPrompt()
+            removeConsentRequest(tunnel.consentId)
+            if (tunnel.usage == 2) checkNoMoreDesktopTunnels()
+            showPendingSessionConsent()
+            refreshInfo()
         }
     }
 
-    private fun pendingFilesConsentTunnels(): List<MeshTunnel> {
-        val agent = meshAgent ?: return emptyList()
-        return agent.tunnels.filter { (it.state == 2) && (it.usage == 5) && it.filesConsentPending }
+    fun isDesktopSessionAuthorized(id: String): Boolean {
+        return meshAgent?.tunnels?.any { it.consentId == id && it.isDesktopAuthorized } == true
     }
 
-    private fun clearFilesConsentPrompt() {
-        if (::appContext.isInitialized) AgentForegroundService.cancelFilesConsentNotification(appContext)
-        filesConsentTimeout?.let { mainHandler.removeCallbacks(it) }
-        filesConsentTimeout = null
-        activity?.dismissConsentPrompt(MainActivity.CONSENT_FILES)
+    fun cancelDesktopSession(id: String) {
+        runOnHostThread {
+            val tunnel = meshAgent?.tunnels?.firstOrNull { it.consentId == id && it.usage == 2 } ?: return@runOnHostThread
+            tunnel.sendConsoleMessage("denied", MeshTunnel.MSGID_CONSENT_DENIED)
+            tunnel.Stop()
+        }
     }
 
     // A remote session needs the display on: wake it when a session starts and keep it on for a
@@ -517,35 +507,29 @@ object AgentController : AgentHost {
         }
     }
 
-    // A capture provider just started: take the consent banner off every viewer of this device.
     fun desktopProviderStarted() {
-        keepScreenAwake()
-        val agent = meshAgent ?: return
-        for (t in agent.tunnels.toList()) {
-            if ((t.state == 2) && (t.usage == 2)) t.sendConsoleMessage(null)
-        }
-        refreshInfo()
-    }
-
-    private fun sendDesktopConsentPending() {
-        val agent = meshAgent ?: return
-        for (t in agent.tunnels.toList()) {
-            if ((t.state == 2) && (t.usage == 2)) {
-                t.sendConsoleMessage(MeshTunnel.CONSENT_PENDING_MESSAGE, MeshTunnel.MSGID_CONSENT_PENDING)
+        runOnHostThread {
+            if (!hasAuthorizedDesktopTunnel()) {
+                stopProjection()
+                return@runOnHostThread
             }
+            keepScreenAwake()
+            for (t in meshAgent?.tunnels.orEmpty()) {
+                if (t.isDesktopAuthorized) t.sendConsoleMessage(null)
+            }
+            refreshInfo()
         }
     }
 
     override fun stopProjection() {
-        if (::appContext.isInitialized) AgentForegroundService.cancelConsentNotification(appContext)
-        cancelDesktopConsentTimeout()
-        releaseScreenAwake()
-        val provider = g_remoteDesktopProvider
-        if (provider is MeshAccessibilityService) {
-            provider.stopDesktop()
-        }
-        if (g_ScreenCaptureService != null) {
-            appContext.startService(ScreenCaptureService.getStopIntent(appContext))
+        runOnHostThread {
+            cancelProjectionRetry()
+            releaseScreenAwake()
+            val provider = g_remoteDesktopProvider
+            if (provider is MeshAccessibilityService) provider.stopDesktop()
+            if (g_ScreenCaptureService != null) {
+                appContext.startService(ScreenCaptureService.getStopIntent(appContext))
+            }
         }
     }
 
@@ -569,9 +553,10 @@ object AgentController : AgentHost {
         return agent.tunnels.any { (it.state == 2) && (it.usage == 2) }
     }
 
-    // The connected desktop tunnel, used to route consent responses to the viewer that opened it.
-    fun activeDesktopTunnel(): MeshTunnel? {
-        return meshAgent?.tunnels?.toList()?.firstOrNull { (it.state == 2) && (it.usage == 2) }
+    fun hasAuthorizedDesktopTunnel(): Boolean = authorizedDesktopTunnel() != null
+
+    private fun authorizedDesktopTunnel(): MeshTunnel? {
+        return meshAgent?.tunnels?.firstOrNull { it.isDesktopAuthorized }
     }
 
     // Display names of the remote users with an active session (desktop or files), de-duplicated.
@@ -580,7 +565,7 @@ object AgentController : AgentHost {
         val agent = meshAgent ?: return emptyList()
         val names = LinkedHashSet<String>()
         for (t in agent.tunnels.toList()) {
-            if (t.state != 2 || t.usage == 10) continue
+            if (!t.isSessionAuthorized || t.usage == 10) continue
             val sessionUser = t.sessionUserName2
             if (sessionUser.isNullOrEmpty()) continue
             names.add(friendlySessionName(agent, sessionUser))
@@ -654,18 +639,18 @@ object AgentController : AgentHost {
     }
 
     fun checkNoMoreDesktopTunnels() {
-        val agent = meshAgent ?: return
-        val activeDesktopTunnels = agent.tunnels.count { (it.state == 2) && (it.usage == 2) }
-        if (activeDesktopTunnels == 0) {
-            stopProjection()
-            refreshInfo()
+        runOnHostThread {
+            if (!hasAuthorizedDesktopTunnel()) {
+                stopProjection()
+                refreshInfo()
+            }
         }
     }
 
     fun sendDesktopTunnelData(data: ByteString) {
         val agent = meshAgent ?: return
         for (t in agent.tunnels.toList()) {
-            if ((t.state == 2) && (t.usage == 2)) {
+            if (t.isDesktopAuthorized) {
                 t._webSocket?.send(data)
             }
         }
@@ -677,7 +662,7 @@ object AgentController : AgentHost {
     fun sendDesktopMessage(message: String, timeoutSeconds: Int? = DESKTOP_NOTICE_TIMEOUT_SECONDS) {
         val agent = meshAgent ?: return
         for (t in agent.tunnels.toList()) {
-            if ((t.state == 2) && (t.usage == 2)) t.sendConsoleMessage(message, timeoutSeconds = timeoutSeconds)
+            if (t.isDesktopAuthorized) t.sendConsoleMessage(message, timeoutSeconds = timeoutSeconds)
         }
     }
 
@@ -706,6 +691,7 @@ object AgentController : AgentHost {
     }
 
     private fun activeInputProvider(): RemoteDesktopProvider? {
+        if (!hasAuthorizedDesktopTunnel() || !isRemoteDesktopRunning()) return null
         val activeProvider = activeRemoteDesktopProvider()
         if (activeProvider is MeshAccessibilityService) return activeProvider
         return MeshAccessibilityService.instance ?: activeProvider

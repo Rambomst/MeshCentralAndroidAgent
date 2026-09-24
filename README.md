@@ -58,6 +58,7 @@ releases require a dedicated signing keystore; see the release guide below.
 	capabilities, and links to all project resources.
 - [Repository overview](docs/overview.md) - architecture, components, project
 	configuration, and development notes.
+- [Testing](docs/testing.md) - portable checks, reports, and coverage limits.
 - [Remote desktop](docs/remote-desktop.md) - screen-capture flow, consent,
 	encoding, and Android platform limitations.
 - [Tunnel authentication](docs/tunnel-authentication.md) - control-channel

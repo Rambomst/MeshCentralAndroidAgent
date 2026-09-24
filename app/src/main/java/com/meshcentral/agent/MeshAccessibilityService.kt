@@ -124,6 +124,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     }
 
     fun startDesktop(): Boolean {
+        if (!AgentController.hasAuthorizedDesktopTunnel()) return false
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             AgentController.sendDesktopMessage("Unattended screenshots require Android 11 or later.", timeoutSeconds = null)
             return false
@@ -145,7 +146,10 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     fun stopDesktop() {
         val wasActive = active
         active = false
+        captureSequence++
+        capturing = false
         mainHandler.removeCallbacks(captureRunnable)
+        mainHandler.removeCallbacks(captureWatchdog)
         releaseHeldPointer()
         shiftHeld = false
         ctrlHeld = false
@@ -492,7 +496,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     @RequiresApi(Build.VERSION_CODES.R)
     private inner class ScreenshotCallback(private val sequence: Int) : AccessibilityService.TakeScreenshotCallback {
         override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
-            if (sequence != captureSequence) {
+            if (!active || sequence != captureSequence) {
                 screenshot.hardwareBuffer.close()
                 return
             }
@@ -519,7 +523,10 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                 } else {
                     bitmap
                 }
-                val sentFrame = encoder.encode(encodedBitmap) { AgentController.sendDesktopTunnelData(it) }
+                if (!active || sequence != captureSequence) return
+                val sentFrame = encoder.encode(encodedBitmap) {
+                    if (active && sequence == captureSequence) AgentController.sendDesktopTunnelData(it)
+                }
                 nextFrameDelayMs = if (sentFrame) {
                     MIN_FRAME_DELAY_MS
                 } else {
@@ -534,8 +541,12 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                 if (encodedBitmap != null && encodedBitmap !== bitmap) encodedBitmap.recycle()
                 bitmap?.recycle()
                 screenshot.hardwareBuffer.close()
-                captureFinished(sequence)
-                scheduleNextCapture()
+                if (sequence == captureSequence) {
+                    captureFinished(sequence)
+                    scheduleNextCapture()
+                } else {
+                    encoder.requestFullFrame()
+                }
             }
         }
 

@@ -76,7 +76,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
     }
 
     private fun processImage(image: android.media.Image) {
-        if ((checkDesktopTunnelPushback() >= 65535) || (meshAgent?.tunnels?.getOrNull(0) == null)) return
+        if ((checkDesktopTunnelPushback() >= 65535) || !AgentController.hasAuthorizedDesktopTunnel()) return
 
         val planes: Array<Plane> = image.getPlanes()
         val buffer = planes[0].buffer
@@ -203,6 +203,11 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
 
     override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
         if (ScreenCaptureService.Companion.isStartCommand(intent)) {
+            val sessionId = intent.getStringExtra(SESSION_ID)
+            if (sessionId == null || !AgentController.isDesktopSessionAuthorized(sessionId)) {
+                if (!isRunning) stopSelf()
+                return START_NOT_STICKY
+            }
             // Create notification
             val notification: Pair<Int, Notification> = NotificationUtils.getNotification(this)
             startForeground(notification.first!!, notification.second)
@@ -323,15 +328,17 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
         private const val TAG = "ScreenCaptureService"
         private const val RESULT_CODE = "RESULT_CODE"
         private const val DATA = "DATA"
+        private const val SESSION_ID = "SESSION_ID"
         private const val ACTION = "ACTION"
         private const val START = "START"
         private const val STOP = "STOP"
         private const val SCREENCAP_NAME = "screencap"
-        fun getStartIntent(context: Context?, resultCode: Int, data: Intent?): Intent {
+        fun getStartIntent(context: Context?, resultCode: Int, data: Intent?, sessionId: String): Intent {
             val intent = Intent(context, ScreenCaptureService::class.java)
             intent.putExtra(ScreenCaptureService.Companion.ACTION, ScreenCaptureService.Companion.START)
             intent.putExtra(ScreenCaptureService.Companion.RESULT_CODE, resultCode)
             intent.putExtra(ScreenCaptureService.Companion.DATA, data)
+            intent.putExtra(SESSION_ID, sessionId)
             return intent
         }
 
@@ -373,7 +380,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
         var maxQueueSize : Long = 0
         for (t in meshAgent!!.tunnels) {
             // If this is a connected desktop tunnel, count it
-            if ((t.state == 2) && (t.usage == 2) && (t._webSocket != null)) {
+            if (t.isDesktopAuthorized && t._webSocket != null) {
                 var qs : Long? = t._webSocket?.queueSize()
                 if ((qs != null) && (qs > maxQueueSize)) { maxQueueSize = qs }
             }
@@ -404,7 +411,7 @@ class ScreenCaptureService : Service(), RemoteDesktopProvider {
     // (re)connect / refresh while the app is in the background on a static screen.
     private fun pushCurrentFrame() {
         val imageReader = mImageReader ?: return
-        if (meshAgent?.tunnels?.getOrNull(0) == null) return
+        if (!AgentController.hasAuthorizedDesktopTunnel()) return
 
         val image = try { imageReader.acquireLatestImage() } catch (e: Exception) { null }
         if (image != null) {

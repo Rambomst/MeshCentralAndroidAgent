@@ -76,9 +76,9 @@ var g_auth_url : Uri? = null
 
 class MainActivity : AppCompatActivity() {
     var alert : AlertDialog? = null
-    // The consent dialog on screen, if any, and which session kind it belongs to.
     private var consentAlert: AlertDialog? = null
-    private var consentAlertKind = 0
+    private var consentAlertId: String? = null
+    private var projectionRequestId: String? = null
     // Set when the user taps "Later" on the unattended setup prompt; suppresses it for this session
     // only, so it returns on the next launch/resume while items are still missing.
     private var unattendedPromptDismissed = false
@@ -91,16 +91,26 @@ class MainActivity : AppCompatActivity() {
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == RESULT_OK) {
-            // The capture service clears the viewer's consent banner once projection is running.
-            ContextCompat.startForegroundService(this, ScreenCaptureService.getStartIntent(this, result.resultCode, result.data))
-        } else {
-            AgentController.denyUnattendedConsent()
+        val id = projectionRequestId
+        projectionRequestId = null
+        if (id != null && AgentController.isDesktopSessionAuthorized(id)) {
+            if (result.resultCode == RESULT_OK && result.data != null) {
+                ContextCompat.startForegroundService(this,
+                    ScreenCaptureService.getStartIntent(this, result.resultCode, result.data, id))
+            } else {
+                AgentController.cancelDesktopSession(id)
+            }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("projectionRequestId", projectionRequestId)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        projectionRequestId = savedInstanceState?.getString("projectionRequestId")
         AgentController.attachActivity(this)
         setContentView(R.layout.activity_main)
 
@@ -139,14 +149,21 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (serverLink != null) {
-            window.decorView.post { showUnattendedSetupPromptIfNeeded(false) }
-            // Retry a session that connected while backgrounded and is waiting to prompt for consent.
-            if (AgentController.hasActiveDesktopTunnel() && !AgentController.isRemoteDesktopRunning()) {
-                AgentController.startProjection()
+            window.decorView.post {
+                if (isFinishing || isDestroyed) return@post
+                showUnattendedSetupPromptIfNeeded(false)
+                if (AgentController.hasAuthorizedDesktopTunnel() && !AgentController.isRemoteDesktopRunning()) {
+                    AgentController.startProjection()
+                }
+                AgentController.showPendingSessionConsent(force = true)
             }
-            AgentController.showPendingFilesConsent()
         }
         invalidateOptionsMenu()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        AgentController.activityPaused()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -592,13 +609,16 @@ class MainActivity : AppCompatActivity() {
         AgentController.startProjection()
     }
 
-    fun startMediaProjectionPrompt() {
+    fun startMediaProjectionPrompt(id: String) {
+        if (projectionRequestId != null || !AgentController.isDesktopSessionAuthorized(id)) return
         if (AgentController.isRemoteDesktopRunning() || (meshAgent == null) || (meshAgent!!.state != 3)) return
         val mProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        projectionRequestId = id
         screenCaptureLauncher.launch(mProjectionManager.createScreenCaptureIntent())
     }
 
-    fun promptScreenShareChoice() {
+    fun promptScreenShareChoice(id: String) {
+        if (!AgentController.isDesktopSessionAuthorized(id)) return
         if (AgentController.isRemoteDesktopRunning() || (meshAgent == null) || (meshAgent!!.state != 3)) return
         if (isFinishing || isDestroyed) return
         if (alert != null) {
@@ -612,39 +632,40 @@ class MainActivity : AppCompatActivity() {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
             .setNeutralButton(R.string.share_screen_once) { _, _ ->
-                startMediaProjectionPrompt()
+                startMediaProjectionPrompt(id)
             }
             .setNegativeButton(android.R.string.cancel) { dialog, _ ->
-                sendDesktopConsentDenied()
+                AgentController.cancelDesktopSession(id)
                 dialog.dismiss()
             }
             .show()
     }
 
     // Per-connection consent prompt for screen sharing.
-    fun promptUnattendedConsent(message: String) {
-        if (AgentController.isRemoteDesktopRunning() || (meshAgent == null) || (meshAgent!!.state != 3)) return
-        showConsentPrompt(CONSENT_DESKTOP, R.string.share_screen_choice_title, message, R.string.share_screen_once,
-            onApprove = { AgentController.confirmUnattendedConsent() },
-            onDeny = { AgentController.denyUnattendedConsent() })
-    }
-
-    fun promptFilesConsent(message: String) {
+    fun promptUnattendedConsent(message: String, id: String) {
         if ((meshAgent == null) || (meshAgent!!.state != 3)) return
-        showConsentPrompt(CONSENT_FILES, R.string.approve_files_title, message, R.string.approve,
-            onApprove = { AgentController.confirmFilesConsent() },
-            onDeny = { AgentController.denyFilesConsent() })
+        showConsentPrompt(id, R.string.share_screen_choice_title, message, R.string.share_screen_once,
+            onApprove = { AgentController.respondToConsent(id, true) },
+            onDeny = { AgentController.respondToConsent(id, false) })
     }
 
-    private fun showConsentPrompt(kind: Int, titleRes: Int, message: String, approveRes: Int, onApprove: () -> Unit, onDeny: () -> Unit) {
+    fun promptFilesConsent(message: String, id: String) {
+        if ((meshAgent == null) || (meshAgent!!.state != 3)) return
+        showConsentPrompt(id, R.string.approve_files_title, message, R.string.approve,
+            onApprove = { AgentController.respondToConsent(id, true) },
+            onDeny = { AgentController.respondToConsent(id, false) })
+    }
+
+    private fun showConsentPrompt(id: String, titleRes: Int, message: String, approveRes: Int, onApprove: () -> Unit, onDeny: () -> Unit) {
         if (isFinishing || isDestroyed) return
+        if (consentAlertId == id && consentAlert?.isShowing == true) return
         consentAlert?.dismiss()
         consentAlert = null
         if (alert != null) {
             alert?.dismiss()
             alert = null
         }
-        consentAlertKind = kind
+        consentAlertId = id
         consentAlert = AlertDialog.Builder(this)
             .setTitle(titleRes)
             .setMessage(message)
@@ -665,15 +686,12 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    fun dismissConsentPrompt(kind: Int) {
-        if (consentAlertKind != kind) return
+    fun dismissConsentPrompt(id: String) {
+        if (consentAlertId != id) return
+        consentAlertId = null
         val dialog = consentAlert ?: return
         consentAlert = null
         dialog.dismiss()
-    }
-
-    private fun sendDesktopConsentDenied() {
-        AgentController.denyUnattendedConsent()
     }
 
     fun stopProjection() {
@@ -687,7 +705,5 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val REQUEST_ALL_PERMISSIONS = 1
         const val REQUEST_LOCAL_NETWORK_PERMISSION = 2
-        const val CONSENT_DESKTOP = 1
-        const val CONSENT_FILES = 2
     }
 }

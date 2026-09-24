@@ -16,6 +16,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 
 class AgentForegroundService : Service() {
     override fun onCreate() {
@@ -32,20 +33,16 @@ class AgentForegroundService : Service() {
             ACTION_DISCONNECT -> if (!AgentController.enterpriseEnforced && meshAgent != null) AgentController.toggleAgentConnection(true)
             ACTION_STOP_SCREEN_SHARING -> AgentController.stopScreenSharingByUser()
             ACTION_APPROVE_SCREEN_SHARING -> {
-                cancelConsentNotification(this)
-                AgentController.confirmUnattendedConsent()
+                intent.getStringExtra(EXTRA_CONSENT_ID)?.let { AgentController.respondToConsent(it, true) }
             }
             ACTION_DENY_SCREEN_SHARING -> {
-                cancelConsentNotification(this)
-                AgentController.denyUnattendedConsent()
+                intent.getStringExtra(EXTRA_CONSENT_ID)?.let { AgentController.respondToConsent(it, false) }
             }
             ACTION_APPROVE_FILES -> {
-                cancelFilesConsentNotification(this)
-                AgentController.confirmFilesConsent()
+                intent.getStringExtra(EXTRA_CONSENT_ID)?.let { AgentController.respondToConsent(it, true) }
             }
             ACTION_DENY_FILES -> {
-                cancelFilesConsentNotification(this)
-                AgentController.denyFilesConsent()
+                intent.getStringExtra(EXTRA_CONSENT_ID)?.let { AgentController.respondToConsent(it, false) }
             }
             ACTION_STOP -> {
                 if (!AgentController.enterpriseEnforced) {
@@ -149,6 +146,7 @@ class AgentForegroundService : Service() {
         private const val SESSION_NOTIFICATION_ID = 2403
         private const val CONSENT_NOTIFICATION_ID = 2404
         private const val FILES_CONSENT_NOTIFICATION_ID = 2405
+        private const val EXTRA_CONSENT_ID = "consentId"
         private const val ACTION_CONNECT = "com.meshcentral.agent.action.CONNECT"
         private const val ACTION_DISCONNECT = "com.meshcentral.agent.action.DISCONNECT"
         private const val ACTION_STOP_SCREEN_SHARING = "com.meshcentral.agent.action.STOP_SCREEN_SHARING"
@@ -193,14 +191,14 @@ class AgentForegroundService : Service() {
         }
 
         // Consent request with Approve/Deny actions, for when the app isn't foregrounded.
-        fun showConsentNotification(context: Context, message: String) {
+        fun showConsentNotification(context: Context, message: String, consentId: String) {
             showConsentNotification(context, CONSENT_NOTIFICATION_ID, context.getString(R.string.approve_screen_sharing_title), message,
-                servicePendingIntent(context, ACTION_APPROVE_SCREEN_SHARING, 4), servicePendingIntent(context, ACTION_DENY_SCREEN_SHARING, 5))
+                servicePendingIntent(context, ACTION_APPROVE_SCREEN_SHARING, 4, consentId), servicePendingIntent(context, ACTION_DENY_SCREEN_SHARING, 5, consentId))
         }
 
-        fun showFilesConsentNotification(context: Context, message: String) {
+        fun showFilesConsentNotification(context: Context, message: String, consentId: String) {
             showConsentNotification(context, FILES_CONSENT_NOTIFICATION_ID, context.getString(R.string.approve_files_title), message,
-                servicePendingIntent(context, ACTION_APPROVE_FILES, 6), servicePendingIntent(context, ACTION_DENY_FILES, 7))
+                servicePendingIntent(context, ACTION_APPROVE_FILES, 6, consentId), servicePendingIntent(context, ACTION_DENY_FILES, 7, consentId))
         }
 
         private fun showConsentNotification(context: Context, id: Int, title: String, message: String, approve: PendingIntent, deny: PendingIntent) {
@@ -265,14 +263,14 @@ class AgentForegroundService : Service() {
             return builder.build()
         }
 
-        private fun servicePendingIntent(context: Context, action: String, requestCode: Int): PendingIntent {
+        private fun servicePendingIntent(context: Context, action: String, requestCode: Int, consentId: String? = null): PendingIntent {
             val intent = Intent(context, AgentForegroundService::class.java)
             intent.action = action
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            } else {
-                PendingIntent.FLAG_UPDATE_CURRENT
+            if (consentId != null) {
+                intent.data = "meshcentral-consent:$consentId".toUri()
+                intent.putExtra(EXTRA_CONSENT_ID, consentId)
             }
+            val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             return PendingIntent.getService(context, requestCode, intent, flags)
         }
 

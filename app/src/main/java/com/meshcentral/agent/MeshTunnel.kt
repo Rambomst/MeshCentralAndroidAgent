@@ -29,7 +29,7 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import kotlin.collections.ArrayList
-import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import kotlin.math.absoluteValue
 import kotlin.random.Random
@@ -51,8 +51,8 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
     private var serverData: JSONObject = serverData
     private var serverTlsCertHash: ByteArray? = null
     private var connectionTimer: CountDownTimer? = null
-    var _webSocket: WebSocket? = null
-    var state: Int = 0 // 0 = Disconnected, 1 = Connecting, 2 = Connected
+    @Volatile var _webSocket: WebSocket? = null
+    @Volatile var state: Int = 0 // 0 = Disconnected, 1 = Connecting, 2 = Connected
     var usage: Int = 0 // 2 = Desktop, 5 = Files, 10 = File transfer
     private var tunnelOptions : JSONObject? = null
     private var lastDirRequest : JSONObject? = null
@@ -66,10 +66,17 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
     var sessionUserName2 : String? = null // UserID/GuestName
     // Server-side consent policy for this session, a bitmask from the tunnel command.
     val consentFlags: Int = serverData.optInt("consent", 0)
-    // A files session waiting for the device user; its commands are held until they decide.
-    @Volatile var filesConsentPending = false
-        private set
-    private val heldFileCommands = CopyOnWriteArrayList<String>()
+    private val authorization = SessionAuthorization()
+    val consentId: String = UUID.randomUUID().toString()
+    val isConsentPending: Boolean get() = state == 2 && authorization.isPending
+    val isSessionAuthorized: Boolean get() = state == 2 && authorization.isApproved
+    val isDesktopAuthorized: Boolean get() = usage == 2 && isSessionAuthorized
+    private val inputPermitted = desktopInputPermitted(
+        serverData.optLong("rights", 0), serverData.optBoolean("desktopviewonly", false)
+    )
+    @Volatile private var desktopSettings: ByteString? = null
+    private val fileExecutor by lazy { Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "MeshFiles") } }
+    private val fileCommands by lazy { ConsentCommandQueue(fileExecutor) }
 
     init { }
 
@@ -146,35 +153,25 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
     }
 
     fun stopSocket() {
-        // Disconnect and clean the relay socket
-        if (_webSocket != null) {
-            try {
-                _webSocket?.close(NORMAL_CLOSURE_STATUS, null)
-                _webSocket = null
-            } catch (ex: Exception) { }
+        if (!authorization.close()) return
+        state = 0
+        val socket = _webSocket
+        _webSocket = null
+        try { socket?.close(NORMAL_CLOSURE_STATUS, null) } catch (ex: Exception) { }
+        if (usage == 5) {
+            fileCommands.close {
+                fileUpload?.discard()
+                fileUpload = null
+                closeBlockDownload()
+            }
+            fileExecutor.shutdown()
         }
-        // Drop any in-flight upload so no descriptor leaks and no partial file is left behind
-        fileUpload?.discard()
-        fileUpload = null
-        closeBlockDownload()
-        // A files session closed while waiting for approval no longer needs the prompt
-        if (filesConsentPending) {
-            filesConsentPending = false
-            heldFileCommands.clear()
-            AgentController.filesConsentResolved()
-        }
-        // Clear the connection timer
-        if (connectionTimer != null) {
+        parent.parent.runOnHostThread {
             connectionTimer?.cancel()
             connectionTimer = null
         }
-        // Remove the tunnel from the parent's list
-        parent.removeTunnel(this) // Notify the parent that this tunnel is done
-
-        // Check if there are no more remote desktop tunnels
-        if (usage == 2) {
-            AgentController.checkNoMoreDesktopTunnels()
-        }
+        parent.removeTunnel(this)
+        AgentController.sessionClosed(this)
     }
 
     fun sendCtrlResponse(values: JSONObject?) {
@@ -200,7 +197,6 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
         const val CONSENT_DESKTOP_PROMPT = 8
         const val CONSENT_FILES_PROMPT = 32
         private const val DEFAULT_CONSENT_TIMEOUT_S = 30
-        private const val MAX_HELD_FILE_COMMANDS = 32
         // Block payload the web UI expects (16 KB minus the 4-byte header).
         private const val DOWNLOAD_BLOCK_SIZE = 16380
     }
@@ -264,47 +260,51 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
         parent.logServerEventEx(id, null, "$msg (${serverData.optString("remoteaddr")})", serverData)
     }
 
-    private fun startFilesSession() {
-        if (consentPromptRequired()) {
-            filesConsentPending = true
+    private fun startSession() {
+        if (isConsentPending) {
             sendConsoleMessage(CONSENT_PENDING_MESSAGE, MSGID_CONSENT_PENDING)
-            AgentController.requestFilesConsent(this)
+            AgentController.requestSessionConsent(this)
         } else {
-            logSessionEvent(if (consentNotifyRequested()) 42 else 43, "Started remote files " + (if (consentNotifyRequested()) "with toast notification" else "without notification"))
-            notifySessionStart()
+            sessionAuthorized(false)
         }
     }
 
-    fun approveFilesConsent() {
-        if (!filesConsentPending) return
-        filesConsentPending = false
-        logSessionEvent(40, "Starting remote files after local user accepted")
-        sendConsoleMessage(null)
+    fun approveConsent() {
+        if (authorization.approve()) sessionAuthorized(true)
+    }
+
+    private fun sessionAuthorized(prompted: Boolean) {
+        if (!isSessionAuthorized) return
+        val files = usage == 5
+        val id = if (prompted) {
+            if (files) 40 else 30
+        } else if (files) {
+            if (consentNotifyRequested()) 42 else 43
+        } else {
+            if (consentNotifyRequested()) 35 else 36
+        }
+        logSessionEvent(id, "Started remote ${if (files) "files" else "desktop"}" +
+            if (prompted) " after local user accepted" else " with automatic consent")
         notifySessionStart()
-        val held = heldFileCommands.toList()
-        heldFileCommands.clear()
-        if (held.isEmpty()) return
-        // Listings and transfers touch storage, so keep them off the main thread the approval came from.
-        thread(name = "MeshFilesConsent") {
-            for (command in held) {
-                try {
-                    processTunnelData(command)
-                } catch (ex: Exception) {
-                    println("Tunnel-Exception: $ex")
-                }
-            }
+        if (files) {
+            sendConsoleMessage(null)
+            fileCommands.approve()
+        } else {
+            AgentController.desktopSessionApproved(this)
         }
     }
 
-    fun denyFilesConsent() {
-        if (!filesConsentPending) return
-        filesConsentPending = false
-        heldFileCommands.clear()
-        logSessionEvent(41, "Failed to start remote files after local user rejected")
+    fun denyConsent() {
+        if (!isConsentPending) return
+        logSessionEvent(if (usage == 5) 41 else 34, "Remote session consent denied")
         sendConsoleMessage("denied", MSGID_CONSENT_DENIED)
         Stop()
     }
 
+    fun applyDesktopSettings() {
+        if (!isDesktopAuthorized) return
+        desktopSettings?.let { processAuthorizedDesktopCmd(5, it.size, it) }
+    }
     // Overlay text on this session's viewer. With msgid the web UI shows its own translated string,
     // otherwise the text as given. A null msg clears the overlay; timeoutSeconds lets the viewer
     // clear it by itself.
@@ -326,7 +326,7 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
     }
 
     override fun onMessage(webSocket: WebSocket, text: String) {
-        //println("Tunnel-onMessage: $text")
+        if (authorization.isClosed) return
         if (state == 0) {
             if ((text == "c") || (text == "cr")) { state = 1; }
             return
@@ -350,6 +350,7 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
                     stopSocket(); return
                 }
                 usage = xusage; // 2 = Desktop, 5 = Files, 10 = File transfer
+                if (usage == 2 || usage == 5) authorization.begin(consentPromptRequired())
                 state = 2
 
                 AgentController.refreshInfo()
@@ -358,27 +359,7 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
                 if (usage != 10) {
                     //println("Connected usage $usage")
                     startConnectionTimer()
-                    if (usage == 2) {
-                        // If this is a remote desktop usage...
-                        if (consentPromptRequired() && !AgentController.isRemoteDesktopRunning()) {
-                            // Consent goes over this desktop tunnel so it reaches the viewer that opened it.
-                            sendConsoleMessage(CONSENT_PENDING_MESSAGE, MSGID_CONSENT_PENDING)
-                        } else {
-                            logSessionEvent(if (consentNotifyRequested()) 35 else 36, "Started remote desktop " + (if (consentNotifyRequested()) "with toast notification" else "without notification"))
-                            notifySessionStart()
-                        }
-                        if (!AgentController.isRemoteDesktopRunning()) {
-                            parent.parent.startProjection()
-                        } else {
-                            sendConsoleMessage(null)
-                            // Send the display size and push a full frame of the current screen so the
-                            // reconnecting viewer sees it immediately instead of waiting for a change.
-                            updateDesktopDisplaySize()
-                            AgentController.requestDesktopRefresh()
-                        }
-                    } else if (usage == 5) {
-                        startFilesSession()
-                    }
+                    if (usage == 2 || usage == 5) startSession()
                 } else {
                     // This is a file transfer
                     if (tunnelOptions == null) {
@@ -401,18 +382,32 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
 
     @Suppress("PARAMETER_NAME_CHANGED_ON_OVERRIDE")
     override fun onMessage(webSocket: WebSocket, msg: ByteString) {
-        //println("Tunnel-onBinaryMessage: ${msg.size}, ${msg.toByteArray().toHex()}")
-        if ((state != 2) || (msg.size < 2)) return;
+        if (state != 2 || msg.size == 0) return
+        if (usage == 5) {
+            if (!fileCommands.submit { processFilePacket(msg) }) stopSocket()
+            return
+        }
+        if (usage != 2 || msg.size < 4) return
+        val cmd = ((msg[0].toInt() and 0xff) shl 8) or (msg[1].toInt() and 0xff)
+        val size = ((msg[2].toInt() and 0xff) shl 8) or (msg[3].toInt() and 0xff)
+        if (size != msg.size) return
+        if (cmd == 5) desktopSettings = msg
+        if (!isDesktopAuthorized || (cmd in setOf(1, 2, 15, 85) && !inputPermitted)) return
+        parent.parent.runOnHostThread {
+            if (!isDesktopAuthorized) return@runOnHostThread
+            try {
+                processAuthorizedDesktopCmd(cmd, size, msg)
+            } catch (ex: Exception) {
+                println("Desktop input failed: $ex")
+            }
+        }
+    }
+
+    private fun processFilePacket(msg: ByteString) {
+        if (!isSessionAuthorized || (msg.size == 1 && msg[0].toInt() == 0)) return
         try {
             if (msg[0].toInt() == 123) {
-                // If we are authenticated, process JSON data
-                val command = String(msg.toByteArray(), Charsets.UTF_8)
-                if (filesConsentPending) {
-                    // Nothing runs until the device user approves; keep the request for then.
-                    if (heldFileCommands.size < MAX_HELD_FILE_COMMANDS) heldFileCommands.add(command)
-                } else {
-                    processTunnelData(command)
-                }
+                processTunnelData(msg.utf8())
             } else if (fileUpload != null) {
                 // If this is file upload data, process it here
                 val stream = fileUpload?.stream ?: return
@@ -442,21 +437,13 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
                 json.put("action", "uploadack")
                 json.put("reqid", fileUploadReqId)
                 if (_webSocket != null) { _webSocket?.send(json.toString().toByteArray().toByteString()) }
-            } else {
-                if (msg.size < 4) return
-                var cmd : Int = (msg[0].toInt() shl 8) + msg[1].toInt()
-                var cmdsize : Int = (msg[2].toInt() shl 8) + msg[3].toInt()
-                if (cmdsize != msg.size) return
-                //println("Cmd $cmd, Size: ${msg.size}, Hex: ${msg.toByteArray().toHex()}")
-                if (usage == 2) processBinaryDesktopCmd(cmd, cmdsize, msg) // Remote desktop
             }
-        }
-        catch (e: Exception) {
-            println("Tunnel-Exception: ${e.toString()}")
+        } catch (ex: Exception) {
+            println("Tunnel-Exception: $ex")
         }
     }
 
-    private fun processBinaryDesktopCmd(cmd : Int, cmdsize: Int, msg: ByteString) {
+    private fun processAuthorizedDesktopCmd(cmd : Int, cmdsize: Int, msg: ByteString) {
         when (cmd) {
             1 -> { // Legacy key input
                 AgentController.handleDesktopKeyCommand(cmd, msg)
@@ -497,7 +484,7 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
 
     fun updateDesktopDisplaySize() {
         val provider = AgentController.activeRemoteDesktopProvider()
-        if ((provider == null) || (_webSocket == null)) return
+        if (!isDesktopAuthorized || provider == null || _webSocket == null) return
 
         // Get the display size
         var mWidth : Int = provider.width
@@ -525,6 +512,7 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
     // Cause some data to be sent over the websocket control channel every 2 minutes to keep it open
     private fun startConnectionTimer() {
         parent.parent.runOnHostThread {
+            if (authorization.isClosed) return@runOnHostThread
             connectionTimer = object: CountDownTimer(120000000, 120000) {
                 override fun onTick(millisUntilFinished: Long) {
                     if (_webSocket != null) {
@@ -829,11 +817,14 @@ class MeshTunnel(parent: MeshAgent, url: String, serverData: JSONObject) : WebSo
     }
 
     fun deleteFileEx(pad: PendingActivityData) {
-        try {
-            parent.parent.contentResolver.delete(pad.url, pad.where, arrayOf(pad.args))
-            fileDeleteResponse(pad.req, true) // Send success
-        } catch (ex: Exception) {
-            fileDeleteResponse(pad.req, false) // Send fail
+        fileCommands.submit {
+            if (!isSessionAuthorized) return@submit
+            try {
+                parent.parent.contentResolver.delete(pad.url, pad.where, arrayOf(pad.args))
+                fileDeleteResponse(pad.req, true)
+            } catch (ex: Exception) {
+                fileDeleteResponse(pad.req, false)
+            }
         }
     }
 
