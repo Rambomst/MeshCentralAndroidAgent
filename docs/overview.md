@@ -45,7 +45,7 @@ a no-op.
 | Minimum Android SDK | 23 (Android 6.0) |
 | Compile/target SDK | 37 |
 | Version | `1.0.23` (`versionCode` 30) |
-| Kotlin | Bundled with the Android Gradle Plugin |
+| Kotlin | Built into the Android Gradle Plugin |
 | Android Gradle Plugin | 9.3.1 |
 | Gradle wrapper | 9.5.0 |
 | Java/Kotlin target | JVM 17 |
@@ -112,9 +112,11 @@ to this shared state directly.
 | 2 | Authenticating |
 | 3 | Connected and authenticated |
 
-The handshake uses a locally generated 2048-bit RSA key pair and self-signed
-X.509 certificate. The app exchanges nonces, validates the server identity from
-the pairing link, signs the handshake, and then sends Android agent metadata and
+The handshake uses a 2048-bit RSA identity held in Android Keystore. New
+identities receive a self-signed X.509 certificate; existing identities are
+imported from older installations. The app exchanges nonces, validates the
+server identity from the pairing link, signs the handshake, and then sends
+Android agent metadata and
 capabilities. Once connected, the control channel:
 
 - Sends device core information, FCM token, network state, and battery state.
@@ -203,8 +205,10 @@ management operations.
 
 1. The user supplies an `mc://host,serverHash,deviceGroupId` link.
 2. The link is stored as `qrmsh` in the `meshagent` SharedPreferences file.
-3. On first connection, the app generates an RSA identity certificate and key,
-   then stores them as Base64 strings in the same preferences file.
+3. Before connecting, the app loads its identity from Android Keystore. It
+   imports an existing certificate/key pair from the legacy `agentCert` and
+   `agentKey` preferences, or generates a new identity when none exists.
+   The legacy entries are removed after the identity is loaded successfully.
 4. `MeshAgent` connects to `/agent.ashx` and authenticates both sides using the
    pairing data, TLS certificate hash, nonces, and signatures.
 5. After authentication, the device reports metadata and waits for commands or
@@ -238,9 +242,12 @@ users cannot replace or clear the configured server.
 
 ## Storage and Process State
 
-Persistent state is split between two SharedPreferences stores:
+Persistent state is held in Android Keystore and two SharedPreferences stores:
 
-- `meshagent`: pairing link, agent certificate, and private key.
+- Android Keystore: the agent certificate and RSA private key under the
+  `meshcentral-agent-identity` alias.
+- `meshagent` preferences: the pairing link (`qrmsh`). Legacy certificate and
+  key entries remain here only until identity migration succeeds.
 - Default preferences: automatic connection and automatic consent flags.
 
 Most live state is held in process-wide Kotlin variables. There is no database,
@@ -281,18 +288,15 @@ during manifest merging.
 
 The main external dependencies are:
 
-- AndroidX AppCompat, Core KTX, Navigation, Lifecycle, Preference, and legacy
-  support libraries.
+- AndroidX AppCompat, Core KTX, Navigation, Lifecycle and Preference.
 - Material Components and ConstraintLayout for the UI.
 - OkHttp for control and relay WebSockets.
-- Spongy Castle for certificate generation and cryptographic operations.
-- Firebase Messaging and Installations-related support for push delivery.
+- Firebase Messaging for push delivery.
 - Code Scanner 2.3.2 (from JitPack) for QR decoding.
 - Dexter for runtime permission flows.
 
-Some declared lifecycle dependencies are not central to the current global-state
-architecture. WebRTC and WorkManager dependencies are present only as commented
-experiments.
+Identity generation and signing use Android Keystore and the platform Java
+security APIs. Dependencies resolve through Google, Maven Central and JitPack.
 
 ## Source Layout
 
@@ -312,17 +316,21 @@ app/
       WebViewFragment.kt               In-app browser
       MeshAgent.kt                     Authenticated control channel
       MeshTunnel.kt                    Desktop/file relay channels
+      ProtocolValidation.kt            Pairing, tunnel and file-path validation
       ScreenCaptureService.kt          MediaProjection screen encoder
       MeshFirebaseMessagingService.kt  FCM handling
       NotificationUtils.kt             Foreground-service notification
     res/                               Layouts, navigation, strings, themes, icons
+  src/test/java/com/meshcentral/agent/
+    ProtocolValidationTest.kt           JVM validation tests
 ```
 
 ## Building and Verification
 
-Build with JDK 17 or newer for the current Android Gradle Plugin 9.3.1 and
-Gradle 9.5 combination. Confirm that `JAVA_HOME` and `java -version` select a
-supported JDK before building.
+The release workflow uses JDK 17, Android Gradle Plugin 9.3.1 and Gradle 9.5.0.
+Install Android SDK 37 and use the repository's Gradle wrapper. Kotlin support
+is [provided by AGP](https://developer.android.com/build/migrate-to-built-in-kotlin).
+Confirm that `JAVA_HOME` and `java -version` select the intended JDK.
 
 From the repository root on Windows:
 
@@ -334,13 +342,16 @@ Useful related tasks include:
 
 ```powershell
 .\gradlew.bat lintDebug
+.\gradlew.bat testDebugUnitTest
 .\gradlew.bat clean
 ```
 
-The repository currently has no active unit or instrumentation test dependencies
-and no test source tree. The test declarations in `app/build.gradle` are
-commented out, so changes currently rely on compilation, lint, and manual testing
-against Android devices and a MeshCentral server.
+The JUnit tests in `ProtocolValidationTest.kt` cover pairing-link validation,
+tunnel usage checks and file-path containment. Device behavior still requires
+manual testing against Android devices and a MeshCentral server.
+
+See [Creating a release](releasing.md) for production signing, version tags and
+publishing APK and AAB assets.
 
 For device-level verification, exercise at least:
 
@@ -374,8 +385,9 @@ not a complete security audit:
   checks, then validates identity inside the MeshCentral handshake using hashes
   from the pairing link. Relay tunnels similarly use explicit certificate-hash
   checks. Changes to this code must preserve protocol pinning and fail closed.
-- **Identity storage:** the agent private key and pairing data are stored in plain
-  SharedPreferences rather than Android Keystore or encrypted preferences.
+- **Identity storage:** the agent identity is held in Android Keystore. Pairing
+  data remains in SharedPreferences. Migration failures block connection and
+  leave the legacy identity available for another attempt.
 - **Global mutable state:** activities, fragments, services, agent state, and 2FA
   data are held in global variables. This makes behavior sensitive to Android
   process death, activity recreation, and concurrent callbacks.
@@ -387,21 +399,17 @@ not a complete security audit:
   release.
 - **Remote-desktop scope:** display capture is implemented, but remote input is
   intentionally absent in the current handlers.
-- **Release signing:** the release build currently uses the debug signing
-  configuration. Production release signing should be supplied outside source
-  control.
-- **Repository hygiene:** `app/release/app-release.aab` is checked into the tree.
-  Decide whether release artifacts should remain versioned.
-- **Dependency/repository age:** JCenter, Spongy Castle, and several dependency
-  versions deserve review during toolchain updates.
-- **Test coverage:** protocol parsing, pairing-link validation, state transitions,
-  and media operations have no automated regression coverage.
+- **Release signing:** local release builds use the production key when all
+  signing environment variables are supplied and fall back to debug signing
+  otherwise. The release workflow requires the production signing secrets.
+- **Test coverage:** the validation tests cover a small part of the protocol;
+  connection state, capture and media operations still need device coverage.
 
 ## Suggested Starting Points for Updates
 
 1. Establish a repeatable debug build and device smoke-test baseline.
-2. Add focused tests around pairing-link parsing, protocol messages, and agent
-   state transitions before restructuring lifecycle code.
+2. Extend protocol tests to cover malformed messages and agent state transitions
+   before restructuring lifecycle code.
 3. Separate protocol/session state from Android UI references so process and
    configuration changes are easier to reason about.
 4. Review identity storage, certificate validation, release signing, and logged

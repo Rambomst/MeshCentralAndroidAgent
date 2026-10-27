@@ -3,7 +3,7 @@ name: Android Release
 on:
   push:
     tags:
-      - "*.*.*"
+      - "[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
 
 permissions:
@@ -19,6 +19,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Require a version tag
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+
       - name: Check out source
         uses: actions/checkout@v5
 
@@ -81,16 +86,11 @@ jobs:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir release
+          cp app/build/outputs/apk/release/app-release.apk release/meshagent_android.apk
           cp app/build/outputs/apk/release/app-release.apk "release/MeshCentral-Agent-${APP_VERSION}.apk"
           cp app/build/outputs/bundle/release/app-release.aab "release/MeshCentral-Agent-${APP_VERSION}.aab"
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: ${{ steps.version.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          files: |
-            release/*.apk
-            release/*.aab
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --draft --generate-notes --title "$GITHUB_REF_NAME"
