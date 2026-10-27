@@ -29,7 +29,7 @@ android {
         minSdk 23
         versionCode 30
         versionName "1.0.23"
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner (project.findProperty("meshTestRunner") ?: "androidx.test.runner.AndroidJUnitRunner")
         def enterpriseEnforced = (project.findProperty("meshEnterpriseEnforced") ?: "false").toString().toBoolean()
         buildConfigField "boolean", "ENTERPRISE_ENFORCED", enterpriseEnforced.toString()
         // Optional "All files access" (MANAGE_EXTERNAL_STORAGE) for full file transfer on Android 11+.

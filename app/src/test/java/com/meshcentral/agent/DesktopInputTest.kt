@@ -5,6 +5,15 @@ import org.junit.Test
 
 class DesktopInputTest {
     @Test
+    fun decodesNormalAndExtendedKeys() {
+        assertEquals(true, decodeKeyDown(0))
+        assertEquals(true, decodeKeyDown(4))
+        assertEquals(false, decodeKeyDown(1))
+        assertEquals(false, decodeKeyDown(3))
+        for (action in listOf(-1, 2, 5, 255)) assertEquals(null, decodeKeyDown(action))
+    }
+
+    @Test
     fun decodesButtonTransitions() {
         assertEquals(MouseInput.Move, decodeMouseFlags(0x00))
         assertEquals(MouseInput.Down(MouseButton.LEFT), decodeMouseFlags(0x02))

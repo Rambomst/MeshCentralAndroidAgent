@@ -1,5 +1,12 @@
 package com.meshcentral.agent
 
+// Extended keys use 4/3 instead of 0/1.
+internal fun decodeKeyDown(action: Int): Boolean? = when (action) {
+    0, 4 -> true
+    1, 3 -> false
+    else -> null
+}
+
 // MeshCentral mouse message flags (byte 5). A button's up flag is its down flag doubled and
 // 0x88 is the viewer's double-click event, which follows the two down/up pairs it already sent.
 internal enum class MouseButton { LEFT, RIGHT, MIDDLE }

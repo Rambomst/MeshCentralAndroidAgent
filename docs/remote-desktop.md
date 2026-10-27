@@ -174,7 +174,7 @@ keyguard's own buttons, which allows a blind unlock with a PIN or password;
 pattern locks cannot be entered remotely. The agent cannot change lock-screen
 security or keep the device unlocked against system policy.
 
-### No silent background start
+### MediaProjection background start
 
 Android controls when an activity and a media-projection foreground service may
 start from the background. The authorization dialog needs an activity that can
@@ -207,13 +207,13 @@ inspection and support rather than smooth video playback.
 
 | Capability | Current behavior | Primary constraint |
 | --- | --- | --- |
-| View the display | Supported after local MediaProjection approval | Android user consent |
+| View the display | MediaProjection after local approval, or accessibility screenshots on Android 11+ | Android permissions and session consent |
 | Multiple viewers | Supported; frames are broadcast to active desktop tunnels | Device and network load |
 | Rotation | Supported by recreating the virtual display | Brief update interruption |
 | Quality and scaling | Supported | Server settings and device cost |
 | Remote tap, long press, drag, or typing | Supported with the accessibility service enabled; otherwise a no-op | Requires user-enabled `MeshAccessibilityService` |
 | Secure or DRM content | Not capturable | Android secure-surface policy |
-| Silent capture after restart | Not supported | MediaProjection authorization and lifecycle rules |
+| Capture after restart | Accessibility capture on Android 11+ after setup; MediaProjection needs fresh approval | Service availability, Android version and session consent |
 | Hide sharing notification | Not supported | Foreground-service requirement |
 | Unlock the lock screen | PIN or password typed blind; the entry screen captures black and pattern locks are not supported | Android keyguard security |
 | Remote desktop audio | Not supported | Not implemented |
@@ -232,5 +232,34 @@ For operation and support, treat the local Android user as the final authority:
 - A denial or system-initiated stop must be respected.
 - Server permissions should restrict who can open remote desktop sessions.
 - Operators should expect protected and policy-managed screens to be hidden.
-- The feature should be described as **remote screen viewing**, not unattended
-  full remote control.
+- Capture and input depend on the granted Android permissions and the session's
+  MeshCentral rights and consent.
+
+## TV controls
+
+With the accessibility service enabled, arrow keys move input focus when no
+text editor has input focus. Tab and Shift+Tab move between controls; Enter and
+Space activate the focused control. A focused editor keeps its normal cursor,
+selection and text-entry behavior.
+
+The agent first uses Android's focus search. For Leanback lists that focus the
+container, it enters a focusable child. If directional focus search returns no
+usable target, it looks for the nearest enabled, visible control in that
+direction within the active window. Custom keyboards can keep their own focus:
+typed characters and deletion use a focused editable node, or the only visible,
+enabled editor in that window. Multiple unfocused editors are left untouched.
+
+The launcher entry supports both phones and TVs; neither a touchscreen nor
+Leanback is required to install the app. Launcher availability does not imply
+that every setup screen or vendor keyboard supports D-pad input. Controls that
+do not expose accessibility nodes may still need mouse clicks.
+
+Fire OS 7 uses Android 9, so it still needs local MediaProjection approval for
+screen capture. The accessibility service provides input during that capture;
+the Android 11 screenshot requirement has not changed. Some Fire TV versions
+do not list third-party accessibility services in Settings and need separate
+device provisioning to enable them.
+
+The TV focus and editor fallback handling is adapted from
+[gitty8's contribution in #51](https://github.com/Ylianst/MeshCentralAndroidAgent/pull/51)
+and [Fire TV feedback on #45](https://github.com/Ylianst/MeshCentralAndroidAgent/pull/45#issuecomment-6013401322).

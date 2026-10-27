@@ -16,14 +16,18 @@ authenticated connection to the server and can:
 - Receive server notifications and a limited set of console commands.
 - Approve or reject MeshCentral push-based two-factor authentication requests.
 
-Remote desktop works two ways. Without extra setup it is **view only** through
-Android's screen-capture consent dialog. Once the device user enables the
-bundled Accessibility Remote Control service, the agent captures the screen in
-the background and injects taps, drags, long presses, scrolling and typing, so
-an operator can control the device unattended. Android shows a persistent
-notification while a session is active, consent prompts follow the server's
+Remote desktop uses Android's screen-capture consent dialog, or accessibility
+screenshots on Android 11 and later. Enabling the bundled Accessibility Remote
+Control service adds taps, drags, long presses, scrolling, typing and D-pad
+navigation. On older Android versions, accessibility input works alongside
+MediaProjection capture, which still needs local approval. Android shows a
+persistent notification while a session is active, consent prompts follow the server's
 policy and the app's Automatic Consent setting, and the user can deny or stop
 sharing at any time.
+
+The app also has an Android TV launcher entry. See the [TV controls and
+limitations](docs/remote-desktop.md#tv-controls) before testing on Fire TV or
+other Android TV devices.
 
 ## Install
 

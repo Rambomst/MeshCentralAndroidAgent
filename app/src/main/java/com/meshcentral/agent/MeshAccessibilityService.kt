@@ -18,6 +18,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.Display
 import android.view.KeyEvent
+import android.view.View
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.annotation.RequiresApi
@@ -74,6 +75,10 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     private var shiftHeld = false
     private var ctrlHeld = false
     private var altHeld = false
+    // ACTION_SET_SELECTION sorts its endpoints, so keep the moving end separately.
+    private var shiftSelectionNode: String? = null
+    private var shiftSelectionAnchor = 0
+    private var shiftSelectionFocus = 0
     // The last text written to a field with SET_TEXT, used while the app is still applying it.
     private var shadowNodeKey: String? = null
     private var shadowText: String? = null
@@ -152,6 +157,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         mainHandler.removeCallbacks(captureWatchdog)
         releaseHeldPointer()
         shiftHeld = false
+        shiftSelectionNode = null
         ctrlHeld = false
         altHeld = false
         if (g_remoteDesktopProvider === this) {
@@ -174,8 +180,8 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         if (msg.size >= 12) {
             val delta = readSignedShort(msg, 10)
             if (delta != 0) {
-                // Wheel: swipe the content under the cursor; a positive delta scrolls up.
-                val distance = if (delta > 0) -SCROLL_STEP_PX else SCROLL_STEP_PX
+                // Wheel-up pulls the content down to reveal earlier items.
+                val distance = if (delta > 0) SCROLL_STEP_PX else -SCROLL_STEP_PX
                 val endY = (y + distance).coerceIn(0, max(0, height - 1))
                 swipeGesture(x, y, x, endY, SCROLL_SWIPE_MS)?.let { enqueue(InputStep.Gesture(it)) }
                 return true
@@ -183,7 +189,10 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         }
 
         when (val input = decodeMouseFlags(u(msg[5]))) {
-            is MouseInput.Down -> if (input.button == MouseButton.LEFT) enqueue(InputStep.Down(x, y))
+            is MouseInput.Down -> if (input.button == MouseButton.LEFT) {
+                shiftSelectionNode = null
+                enqueue(InputStep.Down(x, y))
+            }
             is MouseInput.Up -> when (input.button) {
                 MouseButton.LEFT -> enqueue(InputStep.Up(x, y))
                 // Android has no secondary buttons; follow the scrcpy and Vysor convention instead.
@@ -202,7 +211,10 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         val flags = readInt(msg, 6)
         val (x, y) = toScreen(readShort(msg, 10), readShort(msg, 12))
         when {
-            (flags and TOUCH_FLAG_DOWN) != 0 -> enqueue(InputStep.Down(x, y))
+            (flags and TOUCH_FLAG_DOWN) != 0 -> {
+                shiftSelectionNode = null
+                enqueue(InputStep.Down(x, y))
+            }
             (flags and TOUCH_FLAG_UP) != 0 -> enqueue(InputStep.Up(x, y))
             (flags and TOUCH_FLAG_UPDATE) != 0 -> enqueue(InputStep.Move(x, y))
         }
@@ -210,6 +222,8 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     }
 
     override fun handleKeyCommand(cmd: Int, msg: ByteString): Boolean {
+        // A following key can arrive before Android delivers the previous focus change.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) clearCache()
         val handled = when (cmd) {
             1 -> handleLegacyKey(msg)
             85 -> handleUnicodeKey(msg)
@@ -589,24 +603,30 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
 
     private fun handleLegacyKey(msg: ByteString): Boolean {
         if (msg.size < 6) return false
-        val down = u(msg[4]) == 0
+        val down = decodeKeyDown(u(msg[4])) ?: return false
         val keyCode = u(msg[5])
         when (keyCode) {
-            16 -> { shiftHeld = down; return true }
+            16, 160, 161 -> {
+                if (!down || !shiftHeld) shiftSelectionNode = null
+                shiftHeld = down
+                return true
+            }
             17 -> { ctrlHeld = down; return true }
             18 -> { altHeld = down; return true }
         }
         if (!down) return true
+        if (keyCode !in 37..40 || ctrlHeld) shiftSelectionNode = null
         if (ctrlHeld) return handleShortcut(keyCode)
         when (keyCode) {
             8 -> return (keyguardLocked() && keyguardKey("delete_button", null)) || editorKey(KeyEvent.KEYCODE_DEL) || backspaceFocused()
-            9 -> if (editorKey(KeyEvent.KEYCODE_TAB)) return true
+            9 -> return editorKey(KeyEvent.KEYCODE_TAB) || moveNavigationFocus(if (shiftHeld) View.FOCUS_BACKWARD else View.FOCUS_FORWARD)
             13 -> return (keyguardLocked() && keyguardKey("key_enter", null)) || editorKey(KeyEvent.KEYCODE_ENTER) || enterFocused()
             46 -> return editorKey(KeyEvent.KEYCODE_FORWARD_DEL) || deleteForwardFocused()
-            37 -> return editorKey(KeyEvent.KEYCODE_DPAD_LEFT) || moveFocusedCursor(-1)
-            39 -> return editorKey(KeyEvent.KEYCODE_DPAD_RIGHT) || moveFocusedCursor(1)
-            38 -> return editorKey(KeyEvent.KEYCODE_DPAD_UP) || moveFocusedCursorLine(-1)
-            40 -> return editorKey(KeyEvent.KEYCODE_DPAD_DOWN) || moveFocusedCursorLine(1)
+            37 -> return moveFocusOrCursor(KeyEvent.KEYCODE_DPAD_LEFT, View.FOCUS_LEFT, -1, false)
+            39 -> return moveFocusOrCursor(KeyEvent.KEYCODE_DPAD_RIGHT, View.FOCUS_RIGHT, 1, false)
+            38 -> return moveFocusOrCursor(KeyEvent.KEYCODE_DPAD_UP, View.FOCUS_UP, -1, true)
+            40 -> return moveFocusOrCursor(KeyEvent.KEYCODE_DPAD_DOWN, View.FOCUS_DOWN, 1, true)
+            32 -> return if (editableNode() == null) navigation()?.clickFocused() == true else editorKey(KeyEvent.KEYCODE_SPACE) || insertFocused(" ")
             27 -> return globalAction(GLOBAL_ACTION_BACK)
             36 -> return globalAction(GLOBAL_ACTION_HOME)
             93 -> return globalAction(GLOBAL_ACTION_RECENTS)
@@ -668,7 +688,9 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         // Insert on key-up (action 1). The browser keypress that carries the key-down is deprecated and
         // often doesn't fire, but key-up always does; the panel and physical typing both send an up.
         if (u(msg[4]) != 1) return true
+        shiftSelectionNode = null
         val ch = readShort(msg, 5).toChar()
+        if (ch == ' ' && editableNode() == null) return navigation()?.clickFocused() == true
         // Lock screen PIN pad: no editable field, so press its buttons by hand.
         if (ch.isDigit() && keyguardLocked() && focusedEditable() == null && keyguardKey("key$ch", ch.toString())) return true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -735,7 +757,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                     return true
                 }
             }
-            val node = focusedEditable() ?: return true
+            val node = editableNode() ?: return true
             return when (keyCode) {
                 65 -> setSelectionRange(node, 0, fieldText(node).length)
                 67 -> node.performAction(AccessibilityNodeInfo.ACTION_COPY)
@@ -918,8 +940,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     private fun enterFocused(): Boolean {
         val node = focusedEditable()
         if (node == null) {
-            // No text field: on the lock screen this confirms the PIN.
-            return keyguardLocked() && keyguardKey("key_enter", null)
+            return if (keyguardLocked()) keyguardKey("key_enter", null) else navigation()?.clickFocused() == true
         }
         // A single-line field treats Enter as its keyboard action (sign in, search, unlock); only
         // multi-line text takes a newline.
@@ -950,8 +971,24 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     }
 
     private fun focusedEditable(): AccessibilityNodeInfo? {
-        val node = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return null
-        return if (node.isEditable) node else null
+        return navigation()?.focused()?.takeIf { it.isEditable && it.isFocused }
+    }
+
+    private fun navigation(): DesktopNavigation? = rootInActiveWindow?.let { DesktopNavigation(it) }
+
+    private fun editableNode(): AccessibilityNodeInfo? = navigation()?.editable()
+
+    private fun moveNavigationFocus(direction: Int): Boolean {
+        val navigation = navigation() ?: return false
+        navigation.moveFocus(direction)
+        return true
+    }
+
+    private fun moveFocusOrCursor(keyCode: Int, direction: Int, delta: Int, line: Boolean): Boolean {
+        if (focusedEditable() != null) {
+            return (!shiftHeld && editorKey(keyCode)) || if (line) moveFocusedCursorLine(delta) else moveFocusedCursor(delta)
+        }
+        return moveNavigationFocus(direction)
     }
 
     // A shown hint reads back as node text; treat it as empty so it isn't captured as real content.
@@ -981,10 +1018,13 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     private fun nodeKey(node: AccessibilityNodeInfo): String = "${node.windowId}:${node.hashCode()}"
 
     private fun replaceText(node: AccessibilityNodeInfo, text: String, cursor: Int): Boolean {
+        val previousFocus = if (node.isFocused) null else navigation()?.focused()?.takeIf { it.isFocused && it != node }
         val args = Bundle()
         args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
         setCursor(node, cursor)
+        // TextView can take input focus during ACTION_SET_TEXT, displacing a TV keyboard.
+        previousFocus?.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         shadowNodeKey = nodeKey(node)
         shadowText = text
         shadowCursor = cursor
@@ -1005,7 +1045,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     }
 
     private fun insertFocused(insert: String): Boolean {
-        val node = focusedEditable() ?: return false
+        val node = editableNode() ?: return false
         if (node.isPassword) return typeIntoPassword(node, insert)
         val (text, selection) = fieldState(node)
         val (s, e) = selection
@@ -1013,7 +1053,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     }
 
     private fun backspaceFocused(): Boolean {
-        val node = focusedEditable() ?: return false
+        val node = editableNode() ?: return false
         if (node.isPassword) return typeIntoPassword(node, null)
         val (text, selection) = fieldState(node)
         val (s, e) = selection
@@ -1025,7 +1065,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
     }
 
     private fun deleteForwardFocused(): Boolean {
-        val node = focusedEditable() ?: return false
+        val node = editableNode() ?: return false
         if (node.isPassword) return false
         val (text, selection) = fieldState(node)
         val (s, e) = selection
@@ -1041,10 +1081,8 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         val text = fieldText(node)
         val (s, e) = selectionRange(node, text.length)
         if (shiftHeld) {
-            // Extend from the anchor, which Android keeps as the selection start.
-            val anchor = node.textSelectionStart.coerceIn(0, text.length)
-            val focus = (node.textSelectionEnd.coerceIn(0, text.length) + delta).coerceIn(0, text.length)
-            return setSelectionRange(node, anchor, focus)
+            val (anchor, focus) = shiftSelection(node, text.length)
+            return extendSelection(node, anchor, (focus + delta).coerceIn(0, text.length))
         }
         // A selection collapses to its near edge; otherwise step one character.
         val pos = when {
@@ -1055,10 +1093,26 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
         return setCursor(node, pos)
     }
 
+    private fun shiftSelection(node: AccessibilityNodeInfo, length: Int): Pair<Int, Int> {
+        return if (shiftSelectionNode == nodeKey(node)) {
+            Pair(shiftSelectionAnchor.coerceIn(0, length), shiftSelectionFocus.coerceIn(0, length))
+        } else {
+            Pair(node.textSelectionStart.coerceIn(0, length), node.textSelectionEnd.coerceIn(0, length))
+        }
+    }
+
+    private fun extendSelection(node: AccessibilityNodeInfo, anchor: Int, focus: Int): Boolean {
+        if (!setSelectionRange(node, anchor, focus)) return false
+        shiftSelectionNode = nodeKey(node)
+        shiftSelectionAnchor = anchor
+        shiftSelectionFocus = focus
+        return true
+    }
+
     private fun moveFocusedCursorLine(dir: Int): Boolean {
         val node = focusedEditable() ?: return true
         val text = fieldText(node)
-        val (_, e) = selectionRange(node, text.length)
+        val (anchor, e) = if (shiftHeld) shiftSelection(node, text.length) else selectionRange(node, text.length)
         val lineStart = text.lastIndexOf('\n', (e - 1).coerceAtLeast(0)).let { if (it < 0) 0 else it + 1 }
         val col = e - lineStart
         val pos = if (dir < 0) {
@@ -1073,7 +1127,7 @@ class MeshAccessibilityService : AccessibilityService(), RemoteDesktopProvider {
                 (lineEnd + 1 + col).coerceAtMost(nextEnd)
             }
         }
-        if (shiftHeld) return setSelectionRange(node, node.textSelectionStart.coerceIn(0, text.length), pos)
+        if (shiftHeld) return extendSelection(node, anchor, pos)
         return setCursor(node, pos)
     }
 
